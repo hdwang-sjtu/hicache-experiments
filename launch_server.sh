@@ -64,6 +64,7 @@ if [[ -n "$SGLANG_DIR" && "$SGLANG_DIR" != /* ]]; then SGLANG_DIR="$PWD/$SGLANG_
 # host 网络保留 loopback 控制接口语义；远程客户端通过 SSH 隧道访问。
 # 不把物理 GPU 编号再次传为容器 CUDA_VISIBLE_DEVICES，避免二次编号选择。
 docker_args=(docker run --detach --name "$CONTAINER_NAME" --pull never
+    --cidfile "$RESULTS_DIR/$RUN_ID/container.id"
     --gpus "device=$GPU" --ipc=host --network=host
     --mount "type=bind,src=$MODEL_DIR,dst=/model,readonly"
     --mount "type=bind,src=$SCRIPT_DIR,dst=/experiment,readonly"
@@ -111,14 +112,21 @@ python3 "$SCRIPT_DIR/launch_metadata.py" --directory "$run_dir" --runtime docker
     --model-dir "$MODEL_DIR" --source-dir "$SGLANG_DIR" --gpu "$GPU" \
     --image-id "$image_id" --image-ref "$IMAGE" "${metadata_args[@]}" \
     -- "${docker_args[@]}" "$image_id" "${command[@]}"
-container_id="$("${docker_args[@]}" "$image_id" "${command[@]}")"
+container_id=""
 cleanup() {
+    if [[ -z "$container_id" && -s "$run_dir/container.id" ]]; then
+        container_id="$(cat "$run_dir/container.id")"
+    fi
+    [[ -n "$container_id" ]] || return 0
     docker stop --time 15 "$container_id" >/dev/null 2>&1 || true
     docker rm "$container_id" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+container_id="$("${docker_args[@]}" "$image_id" "${command[@]}")"
+# --cidfile 在创建时记录身份，启动失败时总控仍能按确切 ID 清理。
+[[ -s "$run_dir/container.id" ]] || printf '%s\n' "$container_id" > "$run_dir/container.id"
 echo "启动记录：$run_dir；容器：$CONTAINER_NAME"
 echo '服务地址见启动配置；客户端通过 --base-url 指定地址，也可在容器内运行 Driver。'
 docker logs --follow "$container_id" 2>&1 | tee "$run_dir/server.log"

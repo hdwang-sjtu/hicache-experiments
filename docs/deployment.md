@@ -1,11 +1,16 @@
 # 部署与迁移
 
-[工程入口](../README.md) · [实验用法与指标](usage.md)
+[工程入口](../README.md) · [一键云任务](cloud-task.md) · [实验用法与指标](usage.md)
 
 ## 职责与目录
 
 ```text
 hicache-experiments/
+├── run_all.py             # 总控：实例内一键运行、结果验收与清理
+├── prepare_runtime.py     # 内部工具：固定源码/模型缓存准备
+├── configs/experiments/   # 实验配置，引用服务配置和固定模型版本
+├── configs/runtime.lock.json # 镜像、SGLang 基线、补丁哈希
+├── patches/               # 随工程分发的 SGLang 实验补丁
 ├── launch_server.sh       # Docker 包装：镜像、挂载、容器生命周期
 ├── serve.sh               # 当前环境启动：唯一一份 SGLang 参数
 ├── configs/serve/         # 按名称选择的可迁移 YAML 配置
@@ -13,7 +18,7 @@ hicache-experiments/
 ├── launch_metadata.py     # 内部工具：启动记录和源码快照
 ├── run_experiment.py      # HTTP 客户端、校验、统计、绘图；可单独复制
 ├── requirements-client.txt
-├── requirements-launch.txt  # 命名配置的 PyYAML 依赖
+├── requirements-launch.txt  # 配置解析与模型下载依赖
 ├── tests/                 # 不需要 GPU 的部署/客户端回归
 ├── docs/experiments/      # 纳入 Git 的逐轮实验记录
 └── results/               # 忽略的原始数据与日志
@@ -168,7 +173,8 @@ Vast 普通实例已经是容器，直接使用 `serve.sh`；不要在里面再�
 
 迁移顺序：准备实例 → 复制当前实验仓库和配套 SGLang checkout → 准备模型 → 验证 CUDA → 启动服务 → 小点/最大点验收 → 正式矩阵。
 当前本地提交需要复制或先推送到自己的远程仓库，直接克隆官方 SGLang 不会获得本地实验补丁。
-脚本不负责租机、下载依赖/模型、停止计费实例或回传数据。
+下层服务脚本不负责下载模型；需要自动准备源码、模型和整轮运行时使用 [run_all.py](cloud-task.md)。
+租机、推理依赖安装、停止计费实例与回传数据仍由部署侧负责。
 
 Qwen3-8B、BF16、最大 P=120K/S=2048 的启动参数示例：
 

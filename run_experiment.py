@@ -1627,8 +1627,8 @@ def self_test():
     print("PASS: cache preparation/hits, counters, trace attribution, telemetry gaps/processes, retained attempts, CSV and quantiles (mock clients only)")
 
 
-def main():
-    """解析命令行并分发子命令；CSV 字段名和现有参数名保持稳定。"""
+def build_parser():
+    """构建纯 argparse 接口；总控可复用它校验参数，不导入推理依赖。"""
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1690,6 +1690,28 @@ def main():
     p = sub.add_parser("analyze-traces", help="分析三组各一次的诊断 trace，统计计算/H2D 忙碌区间与重叠")
     p.add_argument("directory", type=Path, help="完整的 --profile 运行目录")
     p.add_argument("--no-plot", action="store_true", help="仅保存 trace 汇总，不绘图")
+    return parser
+
+
+def normalize_run_args(parser, args):
+    """CLI 和总控共用的参数校验与去重。"""
+    if args.profile and (not args.server_profile_dir or not args.server_profile_dir.startswith("/")):
+        parser.error("--profile 需要 --server-profile-dir 指定服务端绝对路径")
+    if args.server_profile_dir and not args.profile:
+        parser.error("--server-profile-dir 只能与 --profile 一起使用")
+    if args.telemetry_same_host and not args.telemetry_dir:
+        parser.error("--telemetry-same-host 需要 --telemetry-dir")
+    for key in ("prefix_lengths", "suffix_lengths", "groups"):
+        setattr(args, key, list(dict.fromkeys(getattr(args, key))))
+    args.max_attempts = args.max_attempts or args.repeats * 3
+    if args.max_attempts < args.repeats:
+        parser.error("--max-attempts must be at least --repeats")
+    return args
+
+
+def main():
+    """解析命令行并分发子命令；CSV 字段名和现有参数名保持稳定。"""
+    parser = build_parser()
     args = parser.parse_args()
     if args.command == "self-test":
         self_test()
@@ -1700,19 +1722,7 @@ def main():
     elif args.command == "analyze-traces":
         analyze_traces(args.directory, args.no_plot)
     else:
-        if args.profile and (not args.server_profile_dir or not args.server_profile_dir.startswith("/")):
-            parser.error("--profile 需要 --server-profile-dir 指定服务端绝对路径")
-        if args.server_profile_dir and not args.profile:
-            parser.error("--server-profile-dir 只能与 --profile 一起使用")
-        if args.telemetry_same_host and not args.telemetry_dir:
-            parser.error("--telemetry-same-host 需要 --telemetry-dir")
-        # 保留用户给出的顺序并去重，避免同一组合被无意重复测量。
-        for key in ("prefix_lengths", "suffix_lengths", "groups"):
-            setattr(args, key, list(dict.fromkeys(getattr(args, key))))
-        args.max_attempts = args.max_attempts or args.repeats * 3
-        if args.max_attempts < args.repeats:
-            parser.error("--max-attempts must be at least --repeats")
-        run(args)
+        run(normalize_run_args(parser, args))
 
 
 if __name__ == "__main__":

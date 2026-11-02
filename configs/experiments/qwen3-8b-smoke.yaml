@@ -1,0 +1,12 @@
+# 总上下文 4K；P=2K、S=128，三组各 3 次，共 9 个正式有效样本。
+serve: qwen3-8b-4k
+model:
+  repo: Qwen/Qwen3-8B
+  revision: b968826d9c46dd6066d109eabc6255188de91218
+test:
+  prefix-lengths: [2k]
+  suffix-lengths: [128]
+  groups: [cold, l1, l2]
+  output-length: 1
+  repeats: 3
+  gpu-timing: true

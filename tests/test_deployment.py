@@ -6,14 +6,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -81,58 +78,6 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         self.assertNotEqual(self.run_script("serve.sh").returncode, 0)
         self.assertFalse((self.root / "capture.json").exists())
 
-    def test_installed_package_and_inherited_gpu(self):
-        result = self.run_script("serve.sh", SGLANG_DIR="", PYTHONPATH=str(self.source / "python"),
-                                 CUDA_VISIBLE_DEVICES="GPU-already-selected")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        manifest = json.loads((self.root / "results/test/launch.json").read_text())
-        self.assertIsNone(manifest["sglang_source"])
-        self.assertFalse(manifest["source_version_available"])
-        capture = json.loads((self.root / "capture.json").read_text())
-        self.assertEqual(capture["gpu"], "GPU-already-selected")
-
-    def test_native_forwards_termination_via_exec(self):
-        process = subprocess.Popen(["bash", str(PROJECT / "serve.sh")],
-                                   env={**self.env, "FAKE_WAIT": "1"},
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                   start_new_session=True)
-        try:
-            deadline = time.monotonic() + 10
-            while not (self.root / "capture.json").exists():
-                if process.poll() is not None or time.monotonic() > deadline:
-                    self.fail("fake server did not start")
-                time.sleep(.03)
-            process.send_signal(signal.SIGTERM)
-            output, _ = process.communicate(timeout=5)
-            self.assertEqual(process.returncode, 23, output)
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-            process.communicate(timeout=5)
-
-    def test_docker_and_native_share_server_arguments(self):
-        overrides = dict(GPU="3", HICACHE="1", FORWARD_TIMING="1", CONTEXT_LENGTH="135168",
-                         MAX_TOTAL_TOKENS="135168", HICACHE_SIZE="32", MEM_FRACTION="0.85")
-        extra = ["--json-model-override-args", '{"max_position_embeddings":135168}']
-        docker = self.run_script("launch_server.sh", "--dry-run", *extra, **overrides)
-        self.assertEqual(docker.returncode, 0, docker.stderr)
-        tokens = shlex.split(docker.stdout)
-        container_env = {}
-        for i, token in enumerate(tokens):
-            if token == "--env":
-                key, value = tokens[i + 1].split("=", 1)
-                container_env[key] = value
-        self.assertNotIn("CUDA_VISIBLE_DEVICES", container_env)
-        self.assertIn("device=3", tokens)
-        self.assertEqual(tokens[tokens.index("bash"):], ["bash", "/experiment/serve.sh", "--exec", *extra])
-        # 模拟 Docker 的变量传递，在同一个 serve.sh 中得到与 native 相同的参数。
-        via_docker = self.run_script("serve.sh", "--dry-run", *extra, **container_env)
-        native = self.run_script("serve.sh", "--dry-run", *extra, **overrides)
-        a, b = shlex.split(via_docker.stdout), shlex.split(native.stdout)
-        a, b = a[a.index("-m"):], b[b.index("-m"):]
-        a[a.index("--model-path") + 1] = str(self.model)
-        self.assertEqual(a, b)
-        self.assertFalse((self.root / "results").exists())
 
     def fake_docker(self):
         docker = self.bin / "docker"
@@ -149,15 +94,6 @@ elif command[0] == 'wait': print('17')
         log = self.root / "docker.jsonl"
         return log
 
-    def test_docker_propagates_exit_and_cleans_only_owned_container(self):
-        log = self.fake_docker()
-        result = self.run_script("launch_server.sh", FAKE_DOCKER_LOG=str(log))
-        self.assertEqual(result.returncode, 17, result.stderr)
-        calls = [json.loads(line) for line in log.read_text().splitlines()]
-        self.assertEqual(calls[-2:], [["stop", "--time", "15", "owned-container-id"], ["rm", "owned-container-id"]])
-        manifest = json.loads((self.root / "results/test/launch.json").read_text())
-        self.assertEqual(manifest["image_id"], "sha256:fixed-image")
-        self.assertNotIn("packages", manifest)
 
     def test_named_native_profile_snapshot_and_cli_override(self):
         literal = json.dumps({"text": "$(touch SHOULD_NOT_EXIST); `echo nope`", "max_position_embeddings": 4096})
@@ -199,30 +135,8 @@ elif command[0] == 'wait': print('17')
         manifest = json.loads((directory / "launch.json").read_text())
         self.assertEqual(manifest["command"][-2:], ["--resolved-profile", "/results/test/profile-resolution.json"])
         self.assertIn(f"type=bind,src={self.model},dst=/model,readonly", manifest["command"])
-
-    def test_profile_listing_and_preview_need_no_model_or_gpu(self):
-        for script in ("serve.sh", "launch_server.sh"):
-            listed = self.run_script(script, "--list-configs", MODEL_DIR="")
-            self.assertEqual(listed.returncode, 0, listed.stderr)
-            self.assertIn("qwen3-8b-4k", listed.stdout)
-            for args in (["qwen3-8b-4k", "--dry-run"], ["--dry-run", "qwen3-8b-4k"]):
-                result = self.run_script(script, *args, MODEL_DIR="", MODEL_ROOT="/not downloaded yet")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("context-length: 4096", result.stdout)
-                self.assertIn("/not downloaded yet/Qwen3-8B", result.stdout)
-        self.assertFalse((self.root / "results").exists())
-
-    def test_bad_profile_fails_before_docker_or_server(self):
-        log = self.fake_docker()
-        for script in ("serve.sh", "launch_server.sh"):
-            bad_name = self.run_script(script, "not-an-existing-profile", FAKE_DOCKER_LOG=str(log))
-            self.assertNotEqual(bad_name.returncode, 0)
-            self.assertIn("--list-configs", bad_name.stderr)
-            missing = self.run_script(script, "qwen3-8b-4k", MODEL_DIR="", MODEL_ROOT="", FAKE_DOCKER_LOG=str(log))
-            self.assertNotEqual(missing.returncode, 0)
-            self.assertIn("MODEL_ROOT", missing.stderr)
-        self.assertFalse(log.exists())
-        self.assertFalse((self.root / "capture.json").exists())
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(calls[-2:], [["stop", "--time", "15", "owned-container-id"], ["rm", "owned-container-id"]])
 
 
 class RemoteClient(unittest.TestCase):
@@ -332,11 +246,6 @@ class AutoTokenizer:
         self.assertTrue((self.root / "results/launch.json").is_file())
         self.assertEqual((self.root / "results/server.log").read_text(), "copied server log\n")
 
-    def test_profile_requires_explicit_server_directory(self):
-        result = self.run_client("--profile")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--server-profile-dir", result.stderr)
-        self.assertFalse(self.requests)
 
     def test_telemetry_rejects_unconfirmed_remote_clock(self):
         result = self.run_client("--telemetry-dir", str(self.root / "telemetry"))

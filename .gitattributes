@@ -1,0 +1,2 @@
+# 统一 diff 的上下文空行本身包含空格，保留补丁字节原样。
+patches/*.patch -whitespace

@@ -1,0 +1,464 @@
+diff --git a/python/sglang/srt/arg_groups/fields/memory.py b/python/sglang/srt/arg_groups/fields/memory.py
+index c79a33346a8539639ada6c407d7a371aea7d4a2e..46f552ad14093bd3cfa761c9c6ffd00a16213327 100644
+--- a/python/sglang/srt/arg_groups/fields/memory.py
++++ b/python/sglang/srt/arg_groups/fields/memory.py
+@@ -96,6 +96,10 @@ class Memory(msgspec.Struct):
+     # Hierarchical cache
+     # -------------------------------------------------------------------------
+     enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
++    enable_hicache_experiment: A[
++        bool,
++        "Enable local-only HiCache inspection/demotion experiments (FULL KV, TP/PP/DP=1).",
++    ] = False
+     hicache_host_memory_mode: A[
+         str,
+         Arg(
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 7165a5ca8c3cceea29b66862bf27f3a2a97c9fae..0b8d15918ffd24ba618cbcce9019fe5148e87c84 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -512,6 +512,7 @@ from sglang.srt.runtime_context import (
+     get_disagg,
+     get_exec,
+     get_lora,
++    get_memory,
+     get_model,
+     get_observability,
+     get_parallel,
+@@ -1024,6 +1025,33 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+     )
+ 
+ 
++@app.post("/debug/hicache")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def hicache_experiment(request: Request):
++    """显式开启后才可用的本地实验入口，实际缓存操作交给 Scheduler。"""
++    from sglang.srt.managers.io_struct import HiCacheExperimentReqInput
++
++    if not get_memory().enable_hicache_experiment:
++        raise HTTPException(status_code=404, detail="HiCache 实验接口未启用")
++    if request.client is None or request.client.host not in ("127.0.0.1", "::1"):
++        raise HTTPException(status_code=403, detail="实验接口只接受本机请求")
++    parallel = get_parallel()
++    if parallel.tp_size != 1 or parallel.pp_size != 1 or parallel.dp_size != 1:
++        raise HTTPException(status_code=400, detail="实验接口仅支持 TP=PP=DP=1")
++    try:
++        obj = HiCacheExperimentReqInput(**(await request.json()))
++        if obj.action not in ("inspect", "demote") or not obj.prefix_ids:
++            raise ValueError("需要 inspect/demote 操作和非空 prefix_ids")
++        if not isinstance(obj.prefix_ids, list) or any(
++            type(token) is not int or token < 0 for token in obj.prefix_ids
++        ):
++            raise ValueError("prefix_ids 必须是非负整数列表")
++    except (TypeError, ValueError) as exc:
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
++    result = await _global_state.tokenizer_manager.hicache_experiment(obj)
++    return ORJSONResponse(msgspec_to_builtins(result))
++
++
+ @app.post("/add_external_corpus")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def add_external_corpus(request: Request):
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index e32fc011409086dc7e5b03b6e80a19900fb4df41..17a578fd5873c32c1ce76c526659b4d71b654455 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1855,6 +1855,20 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
+     message: str = ""
+ 
+ 
++class HiCacheExperimentReqInput(BaseReq, kw_only=True):
++    """本地实验控制消息；缓存操作只能在 Scheduler 进程执行。"""
++
++    action: str
++    prefix_ids: List[int]
++
++
++class HiCacheExperimentReqOutput(BaseReq, kw_only=True):
++    success: bool
++    ready: bool = False
++    message: str = ""
++    state: Dict[str, Any] = msgspec.field(default_factory=dict)
++
++
+ class AddExternalCorpusReqInput(BaseReq, kw_only=True):
+     corpus_id: Optional[str] = None
+     file_path: Optional[str] = None
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 79efa0bacc63b49c08540af6bcc644576e1b12a0..aa136adf57b3aa2a1db4c8dbfb13cb42dde82211 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -150,6 +150,8 @@ from sglang.srt.managers.io_struct import (
+     GetInternalStateReq,
+     GetWeightsByNameReqInput,
+     HealthCheckOutput,
++    HiCacheExperimentReqInput,
++    HiCacheExperimentReqOutput,
+     InitWeightsSendGroupForRemoteInstanceReqInput,
+     InitWeightsSendGroupForRemoteInstanceReqOutput,
+     InitWeightsUpdateGroupReqInput,
+@@ -1749,6 +1751,7 @@ class Scheduler(
+                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
+                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
+                 (FlushCacheReqInput, self.flush_wrapper.handle),
++                (HiCacheExperimentReqInput, self.handle_hicache_experiment),
+                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
+                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
+                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+@@ -5345,6 +5348,42 @@ class Scheduler(
+ 
+         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+ 
++    def handle_hicache_experiment(self, recv_req: HiCacheExperimentReqInput):
++        """只协调控制请求；树结构和槽位操作由缓存自身负责。"""
++        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
++
++        if not get_memory().enable_hicache_experiment:
++            return HiCacheExperimentReqOutput(success=False, message="实验接口未启用")
++        parallel = get_parallel()
++        if (
++            parallel.tp_size != 1
++            or parallel.pp_size != 1
++            or parallel.dp_size != 1
++            or not self.enable_hierarchical_cache
++            or not isinstance(self.tree_cache, UnifiedRadixCache)
++            or not self.spec_algorithm.is_none()
++            or self.disaggregation_mode != DisaggregationMode.NULL
++            or get_memory().enable_session_radix_cache
++        ):
++            return HiCacheExperimentReqOutput(
++                success=False,
++                message="仅支持无推测解码/会话缓存的 FULL KV 单卡 HiCache 实验",
++            )
++        # 包含 overlap 结果队列和 HiCache D2H/H2D；忙时返回，由 Driver 在计时外轮询。
++        if not self.is_fully_idle():
++            return HiCacheExperimentReqOutput(
++                success=True, message="等待请求与异步传输结束"
++            )
++        try:
++            state = self.tree_cache.experiment_control(
++                recv_req.prefix_ids, action=recv_req.action
++            )
++        except (ValueError, RuntimeError) as exc:
++            return HiCacheExperimentReqOutput(
++                success=False, ready=True, message=str(exc)
++            )
++        return HiCacheExperimentReqOutput(success=True, ready=True, state=state)
++
+     def flush_cache(self, empty_cache: bool = True):
+         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+         if self.is_fully_idle(ignore_waiting=self._engine_paused):
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index f62afbae8ed6023cdb161649af1eb70120437731..fefde68ec5ffea23a0c26f6055b1707fa28c4b5b 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -41,6 +41,8 @@ from sglang.srt.managers.io_struct import (
+     GetInternalStateReqOutput,
+     GetWeightsByNameReqInput,
+     GetWeightsByNameReqOutput,
++    HiCacheExperimentReqInput,
++    HiCacheExperimentReqOutput,
+     InitWeightsSendGroupForRemoteInstanceReqInput,
+     InitWeightsSendGroupForRemoteInstanceReqOutput,
+     InitWeightsUpdateGroupReqInput,
+@@ -125,6 +127,7 @@ _COMMUNICATOR_SPECS = [
+     ("slow_down", SlowDownReqOutput),
+     ("pd_role_switch", PdRoleSwitchReqOutput),
+     ("flush_cache", FlushCacheReqOutput),
++    ("hicache_experiment", HiCacheExperimentReqOutput),
+     ("add_external_corpus", AddExternalCorpusReqOutput),
+     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
+     ("list_external_corpora", ListExternalCorporaReqOutput),
+@@ -329,6 +332,12 @@ class TokenizerControlMixin:
+             self.mm_processor.clear_preprocess_cache()
+         return result
+ 
++    async def hicache_experiment(
++        self: TokenizerManager, obj: HiCacheExperimentReqInput
++    ) -> HiCacheExperimentReqOutput:
++        self.auto_create_handle_loop()
++        return (await self.hicache_experiment_communicator(obj))[0]
++
+     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
+         """Clear the hierarchical cache storage."""
+         self.auto_create_handle_loop()
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index d1399f088dc0c8236497fb8c956a3b5a89e9865d..4bb54914a4b5960781ce68223825c49687d78806 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -856,6 +856,141 @@ class UnifiedRadixCache(BasePrefixCache):
+         self._free_values(result.device_frees, result.host_frees)
+         self._accumulate_tracker(tracker, result.tracker)
+ 
++    def experiment_control(self, prefix_ids: list[int], *, action: str) -> dict:
++        """Scheduler 空闲后调用：检查目标 P，或保留 CPU 副本定向逐出 GPU。
++
++        首版只允许单条 FULL-KV 实验分支，避免共享分支和混合组件的隐式逐出。
++        除了复用正常 match 的边界拆分，所有检查都先于释放；绝不直接释放 Tensor。
++        """
++        cc = self.cache_controller
++        if (
++            self.disable
++            or not isinstance(self.tree_core, UnifiedTreeCore)
++            or self.tree_components != (ComponentType.FULL,)
++            or self.sidecar_pool_specs
++            or self.session.slots
++            or self.linker is not None
++            or cc is None
++            or cc.write_policy != "write_through"
++            or self.host_memory_mode != "cache"
++            or self.enable_storage
++        ):
++            raise ValueError(
++                "仅支持 Python TreeCore、无 sidecar/L3 的 FULL-KV write_through 缓存"
++            )
++        if (
++            self.ongoing_write_through
++            or self.ongoing_load_back
++            or cc.has_inflight_device_transfers()
++        ):
++            raise ValueError("备份或恢复尚未完成，不能读取稳定状态或逐出")
++        if action not in ("inspect", "demote"):
++            raise ValueError("未知实验操作")
++        if not prefix_ids or len(prefix_ids) % self.page_size:
++            raise ValueError("prefix_ids 必须非空且按 page_size 对齐")
++        # HTTP/IPC 输入是 list，而真实 serving 的树键统一使用 array('q')。
++        # RadixKey 不会自动转换；混用类型会触发 match_at 的断言并杀死 Scheduler。
++        try:
++            prefix_key = RadixKey(array("q", prefix_ids))
++        except (OverflowError, TypeError) as exc:
++            raise ValueError("prefix_ids 必须能表示为 int64 token 序列") from exc
++
++        # 显式建立零值，保证第一次 H2D 之前的 /metrics 也有可读取的基准。
++        metrics = self.metrics_collector
++        if metrics is not None:
++            metrics.load_back_num_bytes.labels(**metrics.labels)
++            metrics.load_back_num_tokens.labels(
++                **metrics.labels, pool=PoolName.KV.value
++            )
++            metrics.load_back_duration_seconds.labels(**metrics.labels)
++
++        def inspect():
++            # 标准 match 会在 P 处拆分节点，并保留正常的 LRU/引用和备份信息。
++            match = self.match_prefix(MatchPrefixParams(key=prefix_key))
++            node = self.tree_core.node_by_id(match.best_match_node)
++            path = []  # 从 P 末端向根遍历，不包含根。
++            while node.parent is not None:
++                path.append(node)
++                node = node.parent
++            host_tokens = sum(
++                len(node.component_data[ComponentType.FULL].host_value)
++                for node in path
++                if node.component_data[ComponentType.FULL].host_value is not None
++            )
++            device_free = self.token_to_kv_pool_allocator.available_size()
++            host_free = cc.mem_pool_host.available_size()
++            state = dict(
++                prefix_tokens=len(prefix_ids),
++                matched_tokens=match.full_kv_hit_length,
++                device_tokens=match.device_prefix_len,
++                host_hit_tokens=match.host_hit_length,
++                host_backed_tokens=host_tokens,
++                backup_complete=host_tokens == len(prefix_ids)
++                and all(
++                    node.write_through_pending_id is None
++                    and node.load_back_pending_id is None
++                    and node.component_data[ComponentType.FULL].host_value is not None
++                    and len(node.component_data[ComponentType.FULL].host_value)
++                    == len(node.key)
++                    for node in path
++                ),
++                device_free_tokens=device_free,
++                host_free_tokens=host_free,
++                device_used_tokens=self.token_to_kv_pool_allocator.size - device_free,
++                host_used_tokens=cc.mem_pool_host.size - host_free,
++                kv_bytes_per_token=int(cc.mem_pool_host.size_per_token),
++                demoted_tokens=0,
++            )
++            return state, path
++
++        before, path = inspect()
++        if action == "inspect":
++            return before
++        if not before["backup_complete"] or before["matched_tokens"] != len(prefix_ids):
++            raise ValueError("目标 Prefix 没有完整、已完成的 CPU 备份")
++
++        # P 可能还有 S₀ 子节点。先收集其后代，再统一预检，最后从叶子向根逐出。
++        descendants = []
++        stack = list(path[0].children.values())
++        while stack:
++            node = stack.pop()
++            descendants.append(node)
++            stack.extend(node.children.values())
++        order = list(reversed(descendants)) + path
++        for node in order:
++            data = node.component_data[ComponentType.FULL]
++            if len(node.children) > 1 or len(node.parent.children) > 1:
++                raise ValueError("存在额外共享分支，请清空后只预热一个实验输入")
++            if (
++                data.lock_ref
++                or data.host_lock_ref
++                or data.session_ref
++                or node.write_through_pending_id is not None
++                or node.load_back_pending_id is not None
++            ):
++                raise ValueError("目标分支仍有引用或异步操作，拒绝逐出")
++            if data.host_value is None or len(data.host_value) != len(node.key):
++                raise ValueError("目标分支或其后缀没有完整 CPU 副本")
++
++        tracker = {ComponentType.FULL: 0}
++        started = time.perf_counter()
++        for node in order:
++            if not node.evicted:  # 重复 demote 不重复释放槽位。
++                self._demote(node.id, tracker)
++        self.update_eviction_metrics(tracker[ComponentType.FULL], started)
++        after, _ = inspect()
++        if (
++            after["device_tokens"] != 0
++            or after["host_hit_tokens"] != len(prefix_ids)
++            or after["host_backed_tokens"] != len(prefix_ids)
++            or after["host_free_tokens"] != before["host_free_tokens"]
++            or after["device_free_tokens"] - before["device_free_tokens"]
++            != tracker[ComponentType.FULL]
++        ):
++            raise RuntimeError("Demote 后状态校验失败，请停止该次实验并检查缓存")
++        after["demoted_tokens"] = tracker[ComponentType.FULL]
++        return after
++
+     def _drop_subtree_no_host(
+         self, node_id: NodeId, tracker: dict[ComponentType, int]
+     ) -> bool:
+diff --git a/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py b/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
+index 203dbe3ac9df5db5dd3aa518623bda95ab852be2..d306ef158a2a30b8ea609eb7bcc854589a65e793 100644
+--- a/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
++++ b/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
+@@ -12035,5 +12035,129 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
+         cache.sanity_check()
+ 
+ 
++@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
++class TestHiCacheExperiment(CustomTestCase):
++    """防止定向逐出破坏分裂后的 host 索引、引用和 allocator 账目。"""
++
++    @staticmethod
++    def _fixture(*, branching=False):
++        cache, allocator, _ = build_fixture(
++            CacheConfig(kv_size=64, num_layers=2), tree_core_backend="python"
++        )
++        tokens = list(range(1, 13))
++        indices = allocator.alloc(len(tokens))
++        # 与真实 serving 一致：树内存 array，实验接口接收 HTTP list。
++        cache.insert(InsertParams(key=RadixKey(array("q", tokens)), value=indices))
++        if branching:
++            branch = tokens[:8] + [31, 32, 33, 34]
++            branch_indices = torch.cat([indices[:8], allocator.alloc(4)])
++            cache.insert(
++                InsertParams(key=RadixKey(array("q", branch)), value=branch_indices)
++            )
++
++        # 使用真实树、组件和 device allocator；只替代不涉及搬运的 host 槽位管理。
++        stack = list(cache.tree_core.root_node.children.values())
++        offset = 0
++        while stack:
++            node = stack.pop()
++            cache.tree_core.commit_backup(
++                node.id,
++                torch.arange(offset, offset + len(node.key), dtype=torch.int64),
++                {},
++            )
++            cache.tree_core.mark_write_through_pending([node.id], ack_id=node.id)
++            cache.tree_core.finish_write_through([node.id], ack_id=node.id)
++            offset += len(node.key)
++            stack.extend(node.children.values())
++
++        def host_available():
++            return 128 - sum(
++                len(n.component_data[ComponentType.FULL].host_value)
++                for n in cache.tree_core._node_arena.values()
++                if n.parent is not None
++                and n.component_data[ComponentType.FULL].host_value is not None
++            )
++
++        cache.cache_controller = SimpleNamespace(
++            write_policy="write_through",
++            has_inflight_device_transfers=lambda: False,
++            mem_pool_host=SimpleNamespace(
++                size=128, size_per_token=16, available_size=host_available
++            ),
++        )
++        cache.host_memory_mode = "cache"
++        cache.tree_core.set_hicache_enabled()
++        return cache, allocator, tokens
++
++    def test_http_list_inspection_matches_serving_array_keys(self):
++        """回归：空树查询成功，但首次 Prefill 后 list 查询撞上 array 树键会崩溃。"""
++        cache, allocator, tokens = self._fixture()
++        available = allocator.available_size()
++        state = cache.experiment_control(tokens[:8], action="inspect")
++        self.assertEqual(state["matched_tokens"], 8)
++        self.assertEqual(state["device_tokens"], 8)
++        self.assertEqual(state["host_backed_tokens"], 8)
++        self.assertTrue(state["backup_complete"])
++        self.assertEqual(allocator.available_size(), available)
++
++    def test_split_suffix_demotion_preserves_host_and_is_idempotent(self):
++        cache, allocator, tokens = self._fixture()
++        before = cache.experiment_control(tokens[:8], action="inspect")
++        available = allocator.available_size()
++        state = cache.experiment_control(tokens[:8], action="demote")
++        self.assertEqual(state["device_tokens"], 0)
++        self.assertEqual(state["host_hit_tokens"], 8)
++        self.assertEqual(state["host_backed_tokens"], 8)
++        self.assertEqual(state["host_free_tokens"], before["host_free_tokens"])
++        self.assertEqual(state["demoted_tokens"], 12)  # 包含 S₀，不仅是 P。
++        self.assertEqual(allocator.available_size() - available, 12)
++        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
++        self.assertEqual(match.host_hit_length, 12)
++        self.assertEqual(match.device_prefix_len, 0)
++        state = cache.experiment_control(tokens[:8], action="demote")
++        self.assertEqual(state["demoted_tokens"], 0)
++        self.assertEqual(allocator.available_size() - available, 12)
++
++    def test_locked_or_pending_branch_cannot_be_freed(self):
++        cache, allocator, tokens = self._fixture()
++        end = cache.match_prefix(
++            MatchPrefixParams(key=RadixKey(array("q", tokens)))
++        ).best_match_node
++        lock = cache.inc_lock_ref(end).to_dec_params()
++        available = allocator.available_size()
++        with self.assertRaisesRegex(ValueError, "引用"):
++            cache.experiment_control(tokens[:8], action="demote")
++        self.assertEqual(allocator.available_size(), available)
++        cache.dec_lock_ref(end, lock)
++        cache.ongoing_write_through[123] = object()
++        with self.assertRaisesRegex(ValueError, "尚未完成"):
++            cache.experiment_control(tokens[:8], action="demote")
++        self.assertEqual(allocator.available_size(), available)
++
++    def test_unbacked_suffix_is_rejected_before_any_free(self):
++        cache, allocator, tokens = self._fixture()
++        cache.experiment_control(tokens[:8], action="inspect")  # 先在 P 处拆分。
++        end = cache.match_prefix(
++            MatchPrefixParams(key=RadixKey(array("q", tokens)))
++        ).best_match_node
++        cache.tree_core.node_by_id(end).component_data[
++            ComponentType.FULL
++        ].host_value = None
++        available = allocator.available_size()
++        with self.assertRaisesRegex(ValueError, "后缀"):
++            cache.experiment_control(tokens[:8], action="demote")
++        self.assertEqual(allocator.available_size(), available)
++        self.assertEqual(
++            cache.experiment_control(tokens[:8], action="inspect")["device_tokens"], 8
++        )
++
++    def test_shared_branch_is_not_partially_demoted(self):
++        cache, allocator, tokens = self._fixture(branching=True)
++        available = allocator.available_size()
++        with self.assertRaisesRegex(ValueError, "额外共享分支"):
++            cache.experiment_control(tokens[:8], action="demote")
++        self.assertEqual(allocator.available_size(), available)
++
++
+ if __name__ == "__main__":
+     unittest.main()

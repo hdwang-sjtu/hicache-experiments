@@ -2,16 +2,33 @@
 
 比较相同输入 P+S 的 Cold、GPU L1 命中和 CPU L2 恢复性能。P 是历史 Prefix，S 是新增 Suffix；`1K=1024 tokens`。
 
-部署与实验分开，三个入口各自负责一件事：
+可通过总控运行完整任务，也可分别使用三个下层入口：
 
 | 入口 | 职责 | 在哪里运行 |
 |---|---|---|
+| `run_all.py` | 自动准备源码/模型、开服务、测试、校验结果并清理服务 | 云实例内部，或 Docker 宿主机 |
 | `launch_server.sh` | 创建 Docker 容器，挂载模型/源码，调用 `serve.sh`，管理本次容器 | 有 Docker 和 NVIDIA runtime 的宿主机 |
 | `serve.sh` | 统一 SGLang 参数，在当前 Python 环境启动服务 | 已有环境的服务器或云容器内部 |
 | `run_experiment.py` | 通过 HTTP 构造缓存状态、测量、校验、统计和绘图 | 任意能连接服务的客户端 |
 
 服务参数可保存为 `configs/serve/<名称>.yaml`；`serve_config.py` 和 `launch_metadata.py` 是共用的内部解析/记录工具。
-[部署与 Vast.ai 迁移](docs/deployment.md) · [实验用法与指标](docs/usage.md) · [逐轮实验记录](docs/experiments/README.md)
+[一键云任务](docs/cloud-task.md) · [分步部署](docs/deployment.md) · [实验用法与指标](docs/usage.md) · [逐轮实验记录](docs/experiments/README.md)
+
+## 一键运行
+
+已有 SGLang 依赖环境（例如官方镜像创建的 Vast 实例）时：
+
+```bash
+python3 -m pip install -r requirements-launch.txt
+python3 run_all.py qwen3-8b-smoke --dry-run
+python3 run_all.py qwen3-8b-smoke --run-id smoke-001
+```
+
+只有 Docker 环境时使用 `GPU=0 python3 run_all.py qwen3-8b-smoke --runtime docker`。
+任务自动准备固定版本的 SGLang 源码并应用仓库内补丁，下载/复用固定版本模型，完成 P=2K/S=128 的三组各 3 次测量，再停止本次服务。
+结果保存在 `results/<run-id>/`，用 `run.json` 查看状态和失败阶段；原始数据、CSV 和图表位于 `samples/`。
+默认缓存放 `.cache/`，可通过 `HICACHE_CACHE_DIR`、`MODEL_ROOT`、`RESULTS_DIR` 指向持久目录。
+部署前需已有对应 GPU 驱动及推理依赖；脚本不管理云实例计费。详见 [一键云任务](docs/cloud-task.md)。
 
 ## 1. 启动服务：二选一
 
@@ -110,7 +127,7 @@ python3 run_experiment.py analyze results/samples-demo --no-plot
 计时单位为 ms。`prefill_forward_gpu_ms` / `kv_load_ms` 是 GPU 流区间，可包含等待并互相重叠；客户端延迟包含网络。
 Median/P95 基于有效样本，P95 使用线性插值；[完整定义](docs/usage.md#指标含义)。
 
-当前支持自动矩阵采样、校验和绘图；服务启动、可选监控、断点续跑和云实例计费回收没有合成一键编排。
+总控支持自动准备、服务启动、矩阵采样、校验、绘图和服务清理；遥测编排、正式样本断点续跑及云实例计费回收仍独立处理。
 Prefix lookup 独立时间尚未导出。真实 GPU 和新云平台需各自验收，CPU 自测不能替代。
 
 ```bash
