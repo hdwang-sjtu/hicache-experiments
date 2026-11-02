@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cold/L1 缓存实验：构造精确输入、发送请求、验证命中并分析结果。
+"""Cold/L1/L2 缓存实验：构造精确输入、发送请求、验证命中并分析结果。
 
 阅读顺序：main → run → run_samples → execute_sample → validate。
   run        运行实验：准备输入 → 等待服务 → 采样 → 保存 CSV 和汇总。
@@ -8,17 +8,22 @@
 
 约定：P 是可复用的历史前缀长度，S 是本次新增输入长度，S₀ 是预热用后缀。
 Cold 不预热；L1 先发送 P+S₀，再发送 P+S，且 S₀ 与 S 从首个 token 分叉。
-此脚本只实现阶段 1；GPU Prefill 计时和 CPU L2 恢复不在本阶段内。
+L2 先确认 CPU 备份完成，再通过实验接口逐出 GPU。
+--gpu-timing 读取原生 CUDA Event 区间；--profile 单独诊断 Kernel 执行与加载重叠。
 """
 
 import argparse
+from bisect import bisect_right
+from bisect import bisect_left
 import csv
+import gzip
 import hashlib
 import importlib.metadata
 import json
 import math
 import os
 import random
+import re
 import shutil
 import statistics
 import sys
@@ -45,19 +50,220 @@ TIMES = {
     "server_first_token_ms": "first_token_latency",
     "queue_ms": "queue_time",
 }
+# 来自请求前后 /metrics 的差值，不是从 meta_info 里读取。
+LOAD_FIELDS = ("kv_load_ms", "kv_load_tokens", "kv_load_bytes", "kv_load_ops")
+FORWARD_FIELD = "prefill_forward_gpu_ms"
+ENV_FIELDS = (
+    "cache_valid", "environment_valid", "environment_reason",
+    "measurement_start_monotonic_ns", "measurement_end_monotonic_ns",
+    "measurement_start_utc_ns", "measurement_end_utc_ns",
+    "gpu_monitor_max_gap_ms", "host_monitor_max_gap_ms", "unexpected_gpu_pids",
+)
 # CSV 字段保持英文，方便脚本处理；含义见 README 中的“指标含义”。
 FIELDS = [
     "case", "group", "attempt", "request_id", "model", "dtype", "kv_dtype",
     "prefix_length", "suffix_length", "output_length", "input_sha256",
     "prompt_tokens", "completion_tokens", "cached_tokens", "device_tokens",
     "host_tokens", "storage_tokens", "num_retractions", *TIMES,
-    "forward_entry_time", "prefill_finished_time", "valid", "invalid_reason",
+    "forward_entry_time", "prefill_finished_time", *LOAD_FIELDS, FORWARD_FIELD,
+    "device_tokens_before", "host_backed_tokens_before",
+    "device_used_tokens_before", "host_used_tokens_before",
+    "device_used_tokens_after", "host_used_tokens_after", "output_ids", "profiled", *ENV_FIELDS, "valid", "invalid_reason",
 ]
 
 
 def write_json(path, value):
     """保存缩进后的 JSON，便于直接打开检查参数和原始输入。"""
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+class EnvironmentMonitor:
+    """只读宿主机采样，缓存正确性与环境覆盖分别记录，不按延迟大小过滤。"""
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.owner = json.loads((self.directory / "owner.json").read_text())
+        self.offsets = {kind: 0 for kind in ("gpu", "host")}
+        self.records = {kind: [] for kind in self.offsets}
+
+    def refresh(self, keep_since=None):
+        cutoff = time.monotonic_ns() - 120_000_000_000
+        if keep_since is not None:
+            cutoff = min(cutoff, keep_since)
+        for kind in self.records:
+            path = self.directory / f"{kind}.jsonl"
+            if not path.exists():
+                continue
+            with path.open("rb") as file:
+                file.seek(self.offsets[kind])
+                while True:
+                    line = file.readline()
+                    if not line or not line.endswith(b"\n"):
+                        break
+                    self.records[kind].append(json.loads(line))
+                    self.offsets[kind] = file.tell()
+            self.records[kind] = [r for r in self.records[kind] if r["end_monotonic_ns"] >= cutoff]
+
+    def unexpected_pids(self, record):
+        gpu = record.get("gpus", {}).get(str(self.owner["gpu_index"]))
+        if gpu is None or "compute_processes" not in gpu:
+            return None
+        return sorted({p["pid"] for p in gpu["compute_processes"]}
+                      - set(self.owner["allowed_gpu_pids"]))
+
+    def ready_reason(self):
+        self.refresh()
+        now = time.monotonic_ns()
+        for kind, records in self.records.items():
+            if not records:
+                return f"{kind} 采样未就绪"
+            latest = records[-1]
+            if not latest["ok"] or now - latest["end_monotonic_ns"] > 2_000_000_000:
+                return f"{kind} 采样失败或超过 2 秒未更新"
+            if latest["duration_ms"] > 3000:
+                return f"{kind} 查询持续超过 3 秒"
+        pids = self.unexpected_pids(self.records["gpu"][-1])
+        if pids is None or pids:
+            return f"选定 GPU 不可见或出现额外计算进程：{pids}"
+        return ""
+
+    def wait_ready(self):
+        deadline = time.monotonic() + 300
+        announced = False
+        while True:
+            reason = self.ready_reason()
+            if not reason:
+                return
+            if not announced:
+                print("暂停请求，等待环境恢复：" + reason, flush=True)
+                announced = True
+            if time.monotonic() >= deadline:
+                raise RuntimeError("环境持续异常超过 5 分钟：" + reason)
+            time.sleep(.25)
+
+    def evaluate(self, window):
+        start, end = window["measurement_start_monotonic_ns"], window["measurement_end_monotonic_ns"]
+        deadline = time.monotonic() + 3
+        while True:
+            self.refresh(start - 3_000_000_000)
+            if all(rs and rs[-1]["end_monotonic_ns"] >= end for rs in self.records.values()):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(.1)
+        reasons, extra, unexpected = [], {}, set()
+        for kind, records in self.records.items():
+            times = [r["end_monotonic_ns"] for r in records]
+            left, right = bisect_right(times, start)-1, bisect_left(times, end)
+            extra[f"{kind}_monitor_max_gap_ms"] = None
+            if left < 0 or right >= len(times):
+                reasons.append(f"{kind} 缺少请求前后采样覆盖")
+                continue
+            selected = records[left:right+1]
+            gap = max((b-a for a,b in zip(times[left:right+1],times[left+1:right+1])), default=0)
+            extra[f"{kind}_monitor_max_gap_ms"] = gap / 1e6
+            if start-times[left] > 2_000_000_000 or times[right]-end > 2_000_000_000 or gap > 3_000_000_000:
+                reasons.append(f"{kind} 覆盖边界超过 2 秒或采样间隔超过 3 秒")
+            if any(not r["ok"] or r["duration_ms"] > 3000 for r in selected):
+                reasons.append(f"{kind} 采样失败或查询持续超过 3 秒")
+            if kind == "gpu":
+                for record in selected:
+                    pids = self.unexpected_pids(record)
+                    if pids is None:
+                        reasons.append("选定 GPU 缺少进程信息")
+                    else:
+                        unexpected.update(pids)
+        if unexpected:
+            reasons.append(f"选定 GPU 出现额外计算进程：{sorted(unexpected)}")
+        return dict(environment_valid=not reasons,environment_reason="; ".join(dict.fromkeys(reasons)),
+                    unexpected_gpu_pids=json.dumps(sorted(unexpected)),**extra)
+
+
+def sample_gpu_devices(nvml, selected_index):
+    """逐卡记录错误；其他卡故障不能丢掉实验卡的有效采样。"""
+    gpus = {}
+    for index in range(nvml.nvmlDeviceGetCount()):
+        try:
+            # 每轮重新取句柄，初始化时已有故障卡也不影响其他卡。
+            handle = nvml.nvmlDeviceGetHandleByIndex(index)
+            util = nvml.nvmlDeviceGetUtilizationRates(handle)
+            memory = nvml.nvmlDeviceGetMemoryInfo(handle)
+            processes = nvml.nvmlDeviceGetComputeRunningProcesses(handle)
+            gpu = dict(ok=True, uuid=nvml.nvmlDeviceGetUUID(handle), utilization_gpu=util.gpu,
+                       utilization_memory=util.memory, memory_used_bytes=memory.used,
+                       memory_total_bytes=memory.total,
+                       compute_processes=[dict(pid=p.pid, used_bytes=p.usedGpuMemory) for p in processes])
+            # 可选传感器不支持时保留错误，不把缺失值写成假零。
+            gpu["optional_errors"] = {}
+            for key, name, params in (
+                ("temperature_c", "nvmlDeviceGetTemperature", (nvml.NVML_TEMPERATURE_GPU,)),
+                ("power_mw", "nvmlDeviceGetPowerUsage", ()),
+                ("sm_clock_mhz", "nvmlDeviceGetClockInfo", (nvml.NVML_CLOCK_SM,)),
+                ("memory_clock_mhz", "nvmlDeviceGetClockInfo", (nvml.NVML_CLOCK_MEM,)),
+                ("throttle_reasons", "nvmlDeviceGetCurrentClocksThrottleReasons", ()),
+            ):
+                try:
+                    gpu[key] = getattr(nvml, name)(handle, *params)
+                except (AttributeError, nvml.NVMLError) as error:
+                    gpu[key] = None
+                    gpu["optional_errors"][key] = str(error)
+            gpus[str(index)] = gpu
+        except nvml.NVMLError as error:
+            gpus[str(index)] = dict(ok=False, error=repr(error))
+    selected = gpus.get(str(selected_index), {})
+    result = dict(ok=selected.get("ok", False), gpus=gpus)
+    if not result["ok"]:
+        result["error"] = selected.get("error", "选定 GPU 不可见")
+    return result
+
+
+def monitor(args):
+    """GPU 与主机分别运行本函数，NVML 阻塞不会停止主机心跳。"""
+    if args.interval <= 0:
+        raise ValueError("采样间隔必须大于零")
+    directory = args.output_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    owner = json.loads((directory / "owner.json").read_text())
+    if args.kind == "gpu":
+        import pynvml as nvml
+        nvml.nvmlInit()
+    else:
+        import psutil
+        psutil.cpu_percent(percpu=True)
+    with (directory / f"{args.kind}.jsonl").open("a", buffering=1) as log:
+        while not (directory / "stop").exists():
+            start = time.monotonic_ns()
+            record = dict(start_monotonic_ns=start,start_utc_ns=time.time_ns(),ok=True)
+            try:
+                if args.kind == "gpu":
+                    record.update(sample_gpu_devices(nvml, owner["gpu_index"]))
+                else:
+                    record.update(cpu_percent_per_core=psutil.cpu_percent(percpu=True),
+                                  load_average=os.getloadavg(),memory=psutil.virtual_memory()._asdict(),
+                                  disk_io=psutil.disk_io_counters()._asdict(),pressure={})
+                    for kind in ("cpu","memory","io"):
+                        path = Path('/proc/pressure') / kind
+                        record["pressure"][kind] = path.read_text() if path.exists() else None
+                    record["scheduler"] = {}
+                    try:
+                        pid = owner["scheduler_pid"]
+                        process = psutil.Process(pid)
+                        record["scheduler"] = dict(pid=pid,cpu_times=process.cpu_times()._asdict(),
+                                                   ctx_switches=process.num_ctx_switches()._asdict(),
+                                                   memory=process.memory_info()._asdict(),
+                                                   schedstat=(Path('/proc')/str(pid)/'schedstat').read_text())
+                    except (psutil.Error,OSError) as error:
+                        record["scheduler"]["error"] = str(error)
+            except Exception as error:
+                record.update(ok=False,error=repr(error))
+            record.update(end_monotonic_ns=time.monotonic_ns(),end_utc_ns=time.time_ns())
+            record["duration_ms"] = (record["end_monotonic_ns"]-start)/1e6
+            line = json.dumps(record,ensure_ascii=False)
+            log.write(line+'\n')
+            temp = directory / f'{args.kind}.latest.tmp'
+            temp.write_text(line+'\n')
+            temp.replace(directory / f'{args.kind}.latest.json')
+            time.sleep(max(0,args.interval-(time.monotonic_ns()-start)/1e9))
 
 
 def digest(value):
@@ -125,6 +331,11 @@ class Client:
 
     def __init__(self, base_url, timeout, events):
         self.base_url, self.timeout, self.events = base_url.rstrip("/"), timeout, events
+        self.hicache = False  # run() 根据实际服务配置设置，不凭命令行猜测。
+        self.profile_dir = None
+        self.gpu_timing = False
+        self.environment = None
+        self.last_request_window = None
 
     def request(self, path, payload=None, *, stage="control", parse_json=True):
         """发送一次请求，返回响应及客户端耗时；stage 用于区分记录的用途。
@@ -138,6 +349,7 @@ class Client:
             data=body,
             headers={"Content-Type": "application/json"},
         )
+        mono_started, utc_started = time.monotonic_ns(), time.time_ns()
         started = time.perf_counter_ns()
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -163,6 +375,12 @@ class Client:
             self.events.flush()
             raise RuntimeError(f"{stage} {path}: {exc} {body}") from exc
         elapsed = (time.perf_counter_ns() - started) / 1e6
+        self.last_request_window = dict(
+            measurement_start_monotonic_ns=mono_started,
+            measurement_end_monotonic_ns=time.monotonic_ns(),
+            measurement_start_utc_ns=utc_started,
+            measurement_end_utc_ns=time.time_ns(),
+        )
         result = json.loads(raw) if parse_json else raw.decode()
         self.events.write(
             json.dumps(
@@ -171,6 +389,7 @@ class Client:
                     path=path,
                     request_id=(payload or {}).get("rid"),
                     client_latency_ms=elapsed,
+                    **self.last_request_window,
                     response=result,
                 ),
                 ensure_ascii=False,
@@ -184,6 +403,30 @@ class Client:
         # urlopen 会拒绝非成功 HTTP 状态；清空失败时不继续测量。
         # 注意：该接口会同时重置多级缓存，后续不能用它构造 L2 Hit。
         self.request("/flush_cache?timeout=30", {}, parse_json=False)
+
+    def wait_cache(self, prefix_ids, *, demote=False):
+        """在测量区间外等待稳定状态；demote 忙时无副作用，可安全重试。"""
+        deadline = time.monotonic() + self.timeout
+        while True:
+            result, _ = self.request(
+                "/debug/hicache",
+                dict(action="demote" if demote else "inspect", prefix_ids=prefix_ids),
+                stage="demote" if demote else "cache_state",
+            )
+            if not result.get("success"):
+                raise RuntimeError("缓存控制失败：" + result.get("message", str(result)))
+            if result.get("ready"):
+                return result["state"]
+            if time.monotonic() >= deadline:
+                raise TimeoutError("等待缓存备份/恢复结束超时")
+            time.sleep(.02)
+
+    def load_metrics(self, stage):
+        text, _ = self.request("/metrics", stage=stage, parse_json=False)
+        result = parse_load_metrics(text)
+        if self.gpu_timing:
+            result[FORWARD_FIELD] = parse_forward_metric(text)
+        return result
 
     def generate(self, ids, output_length, stage):
         """直接发送 token IDs，避免聊天模板或重新分词改变精确输入长度。"""
@@ -206,6 +449,77 @@ class Client:
         return response, elapsed, request_id
 
 
+def parse_load_metrics(text):
+    """解析单 rank 的四个既有 H2D 指标；缺失、重复或非有限数值不能当作零。"""
+    names = {
+        "sglang:load_back_duration_seconds_sum": "kv_load_ms",
+        "sglang:load_back_tokens_total": "kv_load_tokens",
+        "sglang:load_back_bytes_total": "kv_load_bytes",
+        "sglang:load_back_duration_seconds_count": "kv_load_ops",
+    }
+    result = {}
+    for line in text.splitlines():
+        match = re.fullmatch(r'([\w:]+)(?:\{(.*)\})?\s+(\S+)(?:\s+\S+)?', line)
+        if match is None or match[1] not in names:
+            continue
+        labels = dict(re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', match[2] or ""))
+        if match[1].endswith("tokens_total") and labels.get("pool") != "kv":
+            continue
+        if any(labels.get(rank) != "0" for rank in ("tp_rank", "pp_rank", "dp_rank")):
+            raise RuntimeError("H2D 指标包含非零 rank，不能归属到单卡实验")
+        key = names[match[1]]
+        value = float(match[3])
+        if key in result or not math.isfinite(value) or value < 0:
+            raise RuntimeError(f"H2D 指标重复或数值无效：{key}")
+        if key != "kv_load_ms" and not value.is_integer():
+            raise RuntimeError(f"H2D 计数不是整数：{key}")
+        result[key] = value * 1000 if key == "kv_load_ms" else int(value)
+    missing = set(LOAD_FIELDS) - result.keys()
+    if missing:
+        raise RuntimeError(f"缺少 H2D 指标：{sorted(missing)}；检查实验接口和 --enable-metrics")
+    return result
+
+
+def parse_forward_metric(text):
+    """读取原生 extend CUDA Event 累计区间；缺失表示计时未启用，不能填零。"""
+    values = []
+    for line in text.splitlines():
+        match = re.fullmatch(r'sglang:forward_execution_seconds_total\{(.*)\}\s+(\S+)', line)
+        if match is None:
+            continue
+        labels = dict(re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', match[1]))
+        if labels.get("category") != "extend":
+            continue
+        # 原生 forward 指标没有 dp_rank；DP=1 已由 check_server 强制检查。
+        if any(labels.get(rank) != "0" for rank in ("tp_rank", "pp_rank")) or any(
+            rank in labels and labels[rank] != "0" for rank in ("dp_rank", "moe_ep_rank")
+        ):
+            raise RuntimeError("Forward 指标包含非零 rank")
+        values.append(float(match[2]) * 1000)
+    if len(values) != 1 or not math.isfinite(values[0]) or values[0] <= 0:
+        raise RuntimeError("缺少有效的 extend GPU 时间；以 FORWARD_TIMING=1 重启服务")
+    return values[0]
+
+
+def load_deltas(before, after, p, bytes_per_token, group):
+    """将累计指标转为一次请求的值，并验证传输量；不把提交时间当完成时间。"""
+    values = {key: after[key] - before[key] for key in LOAD_FIELDS}
+    errors = []
+    if any(value < 0 for value in values.values()):
+        errors.append("H2D 累计指标倒退或被重置")
+    expected = p if group == "l2" else 0
+    if values["kv_load_tokens"] != expected:
+        errors.append(f"H2D tokens: expected {expected}, got {values['kv_load_tokens']}")
+    if values["kv_load_bytes"] != expected * bytes_per_token:
+        errors.append("H2D 字节数与实际池的每 token 字节数不符")
+    if group == "l2":
+        if values["kv_load_ops"] <= 0 or values["kv_load_ms"] <= 0:
+            errors.append("L2 没有已完成的 H2D CUDA Event 计时")
+    elif values["kv_load_ops"] != 0 or values["kv_load_ms"] != 0:
+        errors.append("Cold/L1 不应出现 H2D 加载")
+    return values, errors
+
+
 def validate(response, p, s, output_length, group):
     """判断响应能否计入指定组，返回无效原因列表和各层命中数量。
 
@@ -221,13 +535,13 @@ def validate(response, p, s, output_length, group):
         details = dict(device=0, host=0, storage=0)
     if not isinstance(details, dict):
         details = {}
-    expected = p if group == "l1" else 0
+    expected = p if group in ("l1", "l2") else 0
     checks = {
         "prompt_tokens": (meta.get("prompt_tokens"), p + s),
         "completion_tokens": (meta.get("completion_tokens"), output_length),
         "cached_tokens": (cached, expected),
-        "device": (details.get("device"), expected),
-        "host": (details.get("host"), 0),
+        "device": (details.get("device"), p if group == "l1" else 0),
+        "host": (details.get("host"), p if group == "l2" else 0),
         "storage": (details.get("storage", 0), 0),
         "num_retractions": (meta.get("num_retractions"), 0),
     }
@@ -252,19 +566,93 @@ def execute_sample(client, case, group, output_length, stage="measure"):
     清空与准备请求均不计入测量请求的延迟。每次重复都重新准备缓存。
     """
     p, s = len(case["prefix"]), len(case["suffix"])
+    environment = getattr(client, "environment", None)
+    if environment is not None:
+        environment.wait_ready()
     client.flush()
-    if group == "l1":
+    if group in ("l1", "l2"):
         # 预热请求本身应是 Cold；准备失败意味着测量起点不可靠，直接终止。
         prepared, _, _ = client.generate(case["prefix"] + case["warm_suffix"], 1, "prepare")
         errors, _ = validate(prepared, p, s, 1, "cold")
         if errors:
             raise RuntimeError("Preparation failed: " + "; ".join(errors))
+    before_state = None
+    before_metrics = None
+    if getattr(client, "hicache", False):
+        # CPU 副本存在不等于搬运已完成；接口同时检查 Scheduler 和传输状态。
+        before_state = client.wait_cache(case["prefix"])
+        expected = p if group in ("l1", "l2") else 0
+        if (
+            before_state["device_tokens"] != expected
+            or before_state["host_backed_tokens"] != expected
+            or (expected and not before_state["backup_complete"])
+        ):
+            raise RuntimeError(f"测量前缓存状态不符：{before_state}")
+        if group == "l2":
+            before_state = client.wait_cache(case["prefix"], demote=True)
+            if (
+                before_state["device_tokens"] != 0
+                or before_state["host_hit_tokens"] != p
+                or before_state["host_backed_tokens"] != p
+            ):
+                raise RuntimeError(f"Demote 未产生纯 L2 起点：{before_state}")
+        if environment is not None:
+            environment.wait_ready()
+        before_metrics = client.load_metrics("metrics_before")
     # 无论哪一组，发送的测量输入都完全相同。
-    result, elapsed, rid = client.generate(
-        case["prefix"] + case["suffix"], output_length, stage
-    )
+    # 只采集 measure，请求预热、备份和 demote 都在 Profiler 区间外。
+    profiled = stage == "measure" and bool(getattr(client, "profile_dir", None))
+    if profiled:
+        client.request("/start_profile", dict(
+            output_dir=str(client.profile_dir), activities=["CPU", "GPU"],
+            with_stack=False, record_shapes=False,
+            profile_id=f"{case['id']}-{group}-{uuid.uuid4().hex[:8]}",
+            detailed_annotations=True,
+        ), stage="profile_start", parse_json=False)
+    try:
+        result, elapsed, rid = client.generate(
+            case["prefix"] + case["suffix"], output_length, stage
+        )
+        window = dict(getattr(client, "last_request_window", None) or {})
+    finally:
+        if profiled:
+            client.request("/stop_profile", {}, stage="profile_stop", parse_json=False)
     errors, hits = validate(result, p, s, output_length, group)
+    extra = {}
+    if before_state is not None:
+        # 请求结束后等 ACK 被处理再读终值；等待本身不计入客户端请求延迟。
+        after_state = client.wait_cache(case["prefix"])
+        after_metrics = client.load_metrics("metrics_after")
+        extra, load_errors = load_deltas(
+            before_metrics, after_metrics, p, before_state["kv_bytes_per_token"], group
+        )
+        errors.extend(load_errors)
+        if FORWARD_FIELD in before_metrics:
+            extra[FORWARD_FIELD] = after_metrics[FORWARD_FIELD] - before_metrics[FORWARD_FIELD]
+            if extra[FORWARD_FIELD] <= 0:
+                errors.append("Prefill CUDA Event 指标未增加或被重置")
+        output_ids = result.get("output_ids")
+        if (
+            not isinstance(output_ids, list)
+            or len(output_ids) != output_length
+            or any(type(token) is not int for token in output_ids)
+        ):
+            errors.append("缺少生成 token IDs，检查 --return-output-ids")
+        extra.update(
+            device_tokens_before=before_state["device_tokens"],
+            host_backed_tokens_before=before_state["host_backed_tokens"],
+            device_used_tokens_before=before_state["device_used_tokens"],
+            host_used_tokens_before=before_state["host_used_tokens"],
+            device_used_tokens_after=after_state["device_used_tokens"],
+            host_used_tokens_after=after_state["host_used_tokens"],
+        )
     meta = result.get("meta_info", {})
+    cache_valid = not errors
+    environment_result = {}
+    if environment is not None and stage == "measure":
+        environment_result = environment.evaluate(window)
+        if not environment_result["environment_valid"]:
+            errors.append(environment_result["environment_reason"])
     row = dict(
         case=case["id"],
         group=group,
@@ -279,7 +667,13 @@ def execute_sample(client, case, group, output_length, stage="measure"):
         storage_tokens=hits.get("storage", 0),
         valid=not errors,
         invalid_reason="; ".join(errors),
+        output_ids=json.dumps(result.get("output_ids")),
+        profiled=profiled,
+        cache_valid=cache_valid,
+        **window,
+        **environment_result,
     )
+    row.update(extra)
     # 原始时间戳按秒保存；延迟列单独从秒换算为毫秒，避免混淆单位。
     for key in (
         "prompt_tokens", "completion_tokens", "cached_tokens", "num_retractions",
@@ -293,13 +687,12 @@ def execute_sample(client, case, group, output_length, stage="measure"):
     return row
 
 
-def check_server(info, cases, output_length):
+def check_server(info, cases, output_length, groups=None):
     """开始采样前检查服务配置、上下文长度、页对齐和可见的 KV 容量。"""
-    # 当前阶段只接受关闭 HiCache 的单卡、单请求服务，确保命中归属清晰。
+    # 单卡、单请求使累计指标差值可以归属到当前测量请求。
     required = dict(
         enable_metrics=True,
         disable_radix_cache=False,
-        enable_hierarchical_cache=False,
         tp_size=1,
         pp_size=1,
         dp_size=1,
@@ -307,9 +700,21 @@ def check_server(info, cases, output_length):
     )
     for key, expected in required.items():
         if info.get(key) != expected:
-            raise ValueError(f"Phase 1 requires server {key}={expected!r}; got {info.get(key)!r}")
+            raise ValueError(f"Experiment requires server {key}={expected!r}; got {info.get(key)!r}")
+    if info.get("enable_hierarchical_cache"):
+        if (
+            not info.get("enable_hicache_experiment")
+            or info.get("hicache_host_memory_mode") != "cache"
+            or info.get("hicache_write_policy") != "write_through"
+            or info.get("hicache_storage_backend") is not None
+        ):
+            raise ValueError("HiCache 需启用实验接口、cache/write_through 模式且关闭 L3")
+    elif "l2" in (groups or []):
+        raise ValueError("L2 实验需要使用 HICACHE=1 重启服务")
     if info.get("speculative_algorithm"):
         raise ValueError("Disable speculative decoding for this experiment")
+    if info.get("enable_session_radix_cache") or info.get("enable_streaming_session"):
+        raise ValueError("本实验使用普通请求，请关闭会话缓存和 streaming session")
     context = info.get("context_length")
     page = info.get("page_size")
     if not isinstance(context, int) or not isinstance(page, int) or page < 1:
@@ -328,6 +733,7 @@ def run_samples(client, cases, args, writer, file, common):
     """按 P/S 组合采样，直到每组达到指定有效次数，或超过最大尝试次数。"""
     rng = random.Random(args.seed)
     for case in cases:
+        reference_output = None
         # 这里的 warmup 用于预热运行路径，不写入 samples.csv。
         # 它与 execute_sample 内每次 L1 都要执行的 prepare 请求不同。
         for _ in range(args.warmup_rounds):
@@ -335,6 +741,9 @@ def run_samples(client, cases, args, writer, file, common):
                 row = execute_sample(client, case, group, args.output_length, "warmup")
                 if not row["valid"]:
                     raise RuntimeError("Warmup failed: " + row["invalid_reason"])
+                if group == "cold" or reference_output is None:
+                    # 有 Cold 对照时以其输出为准，不让随机先运行的 L2 成为错误参考。
+                    reference_output = row["output_ids"]
         valid = dict.fromkeys(args.groups, 0)
         attempts = dict.fromkeys(args.groups, 0)
         while any(valid[g] < args.repeats for g in args.groups):
@@ -349,6 +758,13 @@ def run_samples(client, cases, args, writer, file, common):
                     )
                 attempts[group] += 1
                 row = execute_sample(client, case, group, args.output_length)
+                if row["valid"]:
+                    if reference_output is None:
+                        reference_output = row["output_ids"]
+                    elif row["output_ids"] != reference_output:
+                        row["valid"] = False
+                        row["cache_valid"] = False
+                        row["invalid_reason"] = "相同测量输入的生成 token 与本组实验参考结果不一致"
                 row.update(common, attempt=attempts[group])
                 # 无效样本也立即落盘，但只增加 attempts，不增加 valid。
                 writer.writerow(row)
@@ -369,11 +785,8 @@ def percentile(values, fraction):
     return values[lo] + (values[hi] - values[lo]) * (position - lo)
 
 
-def analyze(directory, no_plot=False):
-    """从已保存的 CSV 重新计算汇总和图表，不重新运行任何模型请求。"""
-    config = json.loads((directory / "config.json").read_text())
-    with (directory / "samples.csv").open(newline="") as f:
-        rows = list(csv.DictReader(f))
+def summarize_rows(rows, config, metrics, valid_column="valid"):
+    """同一原始表按正式有效或仅缓存有效分别统计，不删除环境异常尝试。"""
     summaries = []
     for p in config["arguments"]["prefix_lengths"]:
         for s in config["arguments"]["suffix_lengths"]:
@@ -385,8 +798,8 @@ def analyze(directory, no_plot=False):
                     and r["group"] == group
                 ]
                 # CSV 读出的布尔值是字符串；只用有效样本计算延迟分布。
-                valid = [r for r in selected if r["valid"] == "True"]
-                for metric in TIMES:
+                valid = [r for r in selected if r.get(valid_column, r["valid"]) == "True"]
+                for metric in metrics:
                     values = [float(r[metric]) for r in valid if r[metric]]
                     summaries.append(
                         dict(
@@ -403,10 +816,25 @@ def analyze(directory, no_plot=False):
                             p95=percentile(values, .95) if values else None,
                         )
                     )
-    with (directory / "summary.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(summaries[0]))
-        writer.writeheader()
-        writer.writerows(summaries)
+    return summaries
+
+
+def analyze(directory, no_plot=False):
+    """从已保存的 CSV 重新计算汇总和图表，不重新运行任何模型请求。"""
+    config = json.loads((directory / "config.json").read_text())
+    with (directory / "samples.csv").open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    # 老结果没有 H2D 列，不能把“未测量”填成零。
+    metrics = list(TIMES) + [key for key in (*LOAD_FIELDS, FORWARD_FIELD) if any(r.get(key) for r in rows)]
+    summaries = summarize_rows(rows, config, metrics)
+    outputs = [("summary.csv", summaries)]
+    if any(r.get("cache_valid") for r in rows):
+        outputs.append(("all_cache_valid_summary.csv", summarize_rows(rows, config, metrics, "cache_valid")))
+    for name, data in outputs:
+        with (directory / name).open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(data[0]))
+            writer.writeheader()
+            writer.writerows(data)
     if not no_plot:
         # Docker 中按 UID 运行的用户可能没有可写 home，缓存改放结果目录。
         os.environ.setdefault("MPLCONFIGDIR", str(directory.resolve() / ".matplotlib"))
@@ -420,49 +848,274 @@ def analyze(directory, no_plot=False):
             print("CSV analysis complete; plot unavailable: install matplotlib and rerun analyze.", file=sys.stderr)
             return
         suffixes = config["arguments"]["suffix_lengths"]
-        # 每个 S 一张子图，横轴为 P；只画收满有效样本的组。
+        prefixes = config["arguments"]["prefix_lengths"]
+        scan_suffix = len(prefixes) == 1 and len(suffixes) > 1
+        xkey = "suffix_length" if scan_suffix else "prefix_length"
+        fixed_key = "prefix_length" if scan_suffix else "suffix_length"
+        panels = prefixes if scan_suffix else suffixes
+        # 固定 P 时横轴改为 S；否则每个 S 一张 P 扫描子图。
         # 图中文字保留英文，避免依赖容器中的中文字库。
-        fig, axes = plt.subplots(
-            1, len(suffixes), figsize=(6 * len(suffixes), 4), squeeze=False
-        )
-        for ax, s in zip(axes[0], suffixes):
+        columns = min(3, len(panels))
+        nrows = math.ceil(len(panels) / columns)
+        fig, axes = plt.subplots(nrows, columns, figsize=(6 * columns, 4 * nrows), squeeze=False)
+        for ax in list(axes.flat)[len(panels):]:
+            ax.set_visible(False)
+        for ax, fixed in zip(axes.flat, panels):
             for group in config["arguments"]["groups"]:
                 data = sorted(
                     [
                         r for r in summaries
-                        if r["suffix_length"] == s
+                        if r[fixed_key] == fixed
                         and r["group"] == group
                         and r["metric"] == "server_first_token_ms"
                         and r["complete"]
                     ],
-                    key=lambda r: r["prefix_length"],
+                    key=lambda r: r[xkey],
                 )
                 if data:
                     ax.plot(
-                        [r["prefix_length"] for r in data],
+                        [r[xkey] for r in data],
                         [r["median"] for r in data],
                         "o-",
                         label=f"{group} median",
                     )
                     ax.plot(
-                        [r["prefix_length"] for r in data],
+                        [r[xkey] for r in data],
                         [r["p95"] for r in data],
                         "x--",
                         label=f"{group} p95",
                     )
             ax.set(
-                title=f"Suffix = {s} tokens",
-                xlabel="Prefix tokens",
+                title=f"{'Prefix' if scan_suffix else 'Suffix'} = {fixed} tokens",
+                xlabel="Suffix tokens" if scan_suffix else "Prefix tokens",
                 ylabel="Server first-token latency (ms)",
             )
             ax.grid(alpha=.3)
+            ax.set_yscale("log")
             if ax.lines:
                 ax.legend()
         status = config.get("status", "unknown")
-        fig.suptitle(f"{config.get('model', 'model')} — run: {status}; complete groups only")
+        if config["arguments"].get("profile"):
+            status += "; PROFILER ENABLED (diagnostic only)"
+        note = config["arguments"].get("note", "")
+        title = f"{config.get('model', 'model')} — run: {status}; complete groups only"
+        fig.suptitle(title + ("\n" + note if note else ""))
         fig.tight_layout()
         fig.savefig(directory / "latency.png", dpi=160)
         plt.close(fig)
+        if FORWARD_FIELD in metrics:
+            plot_timing(directory, config, summaries, plt)
+        if len(prefixes) > 1 and len(suffixes) > 1:
+            plot_heatmaps(directory, config, summaries, plt)
+
+
+def plot_timing(directory, config, summaries, plt):
+    """并排画流区间，避免把可重叠的 H2D 和 forward 画成串行堆叠图。"""
+    prefixes = config["arguments"]["prefix_lengths"]
+    suffixes = config["arguments"]["suffix_lengths"]
+    scan_prefix = len(prefixes) > 1
+    xkey = "prefix_length" if scan_prefix else "suffix_length"
+    fixed_key = "suffix_length" if scan_prefix else "prefix_length"
+    panels = suffixes if scan_prefix else prefixes
+    columns = min(3, len(panels))
+    nrows = math.ceil(len(panels) / columns)
+    fig, axes = plt.subplots(nrows, columns, figsize=(7 * columns, 4 * nrows), squeeze=False)
+    for ax in list(axes.flat)[len(panels):]:
+        ax.set_visible(False)
+    for ax, fixed in zip(axes.flat, panels):
+        for group, metric, label in (
+            ("l1", FORWARD_FIELD, "L1 forward span"),
+            ("l2", "kv_load_ms", "L2 H2D span"),
+            ("l2", FORWARD_FIELD, "L2 forward span (includes waits)"),
+        ):
+            data = sorted((r for r in summaries if r[fixed_key] == fixed
+                           and r["group"] == group and r["metric"] == metric
+                           and r["complete"] and r["median"] is not None),
+                          key=lambda r: r[xkey])
+            if data:
+                medians = [r["median"] for r in data]
+                ax.errorbar([r[xkey] for r in data], medians,
+                            yerr=[[0] * len(data), [max(0, r["p95"] - r["median"]) for r in data]],
+                            marker="o", capsize=3, label=label)
+        ax.set(title=f"{'Suffix' if scan_prefix else 'Prefix'} = {fixed} tokens",
+               xlabel="Prefix tokens" if scan_prefix else "Suffix tokens",
+               ylabel="CUDA Event interval (ms)")
+        ax.grid(alpha=.3)
+        if ax.lines:
+            ax.legend()
+    note = config["arguments"].get("note", "")
+    title = "Median / P95 stream intervals; H2D and forward may overlap"
+    fig.suptitle(title + ("\n" + note if note else ""))
+    fig.tight_layout()
+    fig.savefig(directory / "timing.png", dpi=160)
+    plt.close(fig)
+
+
+def plot_heatmaps(directory, config, summaries, plt):
+    """完整 P/S 矩阵按类别显示；缺测格留空，不以插值伪造测量。"""
+    from matplotlib.colors import LogNorm
+    prefixes = config["arguments"]["prefix_lengths"]
+    suffixes = config["arguments"]["suffix_lengths"]
+    for metric in (FORWARD_FIELD, "server_first_token_ms"):
+        for statistic in ("median", "p95"):
+            values = {(r["prefix_length"], r["suffix_length"]): r[statistic] for r in summaries
+                      if r["group"] == "l1" and r["metric"] == metric and r["complete"]
+                      and r[statistic] is not None}
+            finite = [v for v in values.values() if v > 0]
+            if not finite:
+                continue
+            grid = [[values.get((p, s), float("nan")) for s in suffixes] for p in prefixes]
+            fig, ax = plt.subplots(figsize=(12, max(5, len(prefixes) * .45)))
+            chart = ax.imshow(grid, origin="lower", aspect="auto",
+                              norm=LogNorm(vmin=min(finite), vmax=max(max(finite), min(finite)*1.001)))
+            ax.set(xticks=list(range(len(suffixes))), xticklabels=suffixes,
+                   yticks=list(range(len(prefixes))), yticklabels=[f"{p//1024}K" for p in prefixes],
+                   xlabel="Suffix tokens", ylabel="Prefix tokens")
+            for i, p in enumerate(prefixes):
+                for j, s in enumerate(suffixes):
+                    value = values.get((p, s))
+                    if value is not None:
+                        ax.text(j, i, f"{value:.1f}", ha="center", va="center", fontsize=7,
+                                color="white" if chart.norm(value) < .6 else "black")
+            fig.colorbar(chart, ax=ax, label="ms (log color scale)")
+            fig.suptitle(f"L1 {metric} — {statistic}\n" + config["arguments"].get("note", ""))
+            fig.tight_layout()
+            fig.savefig(directory / f"{metric}_{statistic}_heatmap.png", dpi=160)
+            plt.close(fig)
+
+
+def merge_intervals(intervals):
+    """同一时钟上的区间先取并集，避免并发 Kernel 被重复累计。"""
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def overlap_duration(left, right):
+    """输入为已合并、按起点排序的区间，单位沿用 trace 的微秒。"""
+    i = j = 0
+    total = 0.
+    while i < len(left) and j < len(right):
+        total += max(0, min(left[i][1], right[j][1]) - max(left[i][0], right[j][0]))
+        if left[i][1] < right[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def trace_intervals(events):
+    """通过 CUDA correlation 和 CPU step 范围归属 forward Kernel，不硬编码 stream ID。"""
+    steps = {}
+    for event in events:
+        if event.get("cat") == "user_annotation" and event.get("name", "").startswith("step[EXTEND "):
+            steps.setdefault((event["pid"], event["tid"]), []).append(event)
+    for group in steps.values():
+        group.sort(key=lambda e: e["ts"])
+    starts = {key: [e["ts"] for e in group] for key, group in steps.items()}
+    forward_correlations = set()
+    for event in events:
+        key = (event.get("pid"), event.get("tid"))
+        if event.get("cat") not in ("cuda_runtime", "cuda_driver") or key not in steps:
+            continue
+        index = bisect_right(starts[key], event["ts"]) - 1
+        if index >= 0 and event["ts"] <= steps[key][index]["ts"] + steps[key][index]["dur"]:
+            correlation = event.get("args", {}).get("correlation")
+            if correlation is not None:
+                forward_correlations.add(correlation)
+    forward, h2d, h2d_names = [], [], set()
+    forward_count = h2d_count = 0
+    for event in events:
+        if event.get("cat") != "kernel":
+            continue
+        if event.get("args", {}).get("device") != 0:
+            raise ValueError("只支持单卡 trace 的区间归属")
+        interval = (event["ts"], event["ts"] + event["dur"])
+        # 对应 pool_host/mha.py 的 kernel 后端逐层恢复；不把 D2H relayout 算成 H2D。
+        if re.search(r"hicache_transfer_per_layer|transfer_kv_per_layer", event["name"]):
+            h2d.append(interval)
+            h2d_names.add(event["name"])
+            h2d_count += 1
+        elif event.get("args", {}).get("correlation") in forward_correlations:
+            forward.append(interval)
+            forward_count += 1
+    tokens = sum(int(re.search(r"\btoks=(\d+)", e["name"])[1])
+                 for group in steps.values() for e in group)
+    return merge_intervals(forward), merge_intervals(h2d), dict(
+        forward_kernel_count=forward_count, h2d_kernel_count=h2d_count,
+        forward_input_tokens=tokens, h2d_kernel_names=sorted(h2d_names),
+    )
+
+
+def analyze_traces(directory, no_plot=False):
+    """诊断 trace：计算 Kernel 忙碌区间与 H2D 的交集，结果与正式性能 CSV 分开。"""
+    config = json.loads((directory / "config.json").read_text())
+    if not config["arguments"].get("profile") or config["status"] != "complete":
+        raise ValueError("需要完整的 --profile 诊断运行目录")
+    with (directory / "samples.csv").open() as file:
+        samples = list(csv.DictReader(file))
+    results, timelines = [], []
+    for path in sorted((directory / "traces").glob("*.trace.json.gz")):
+        match = re.match(r"p(\d+)_s(\d+)-(cold|l1|l2)-", path.name)
+        if match is None:
+            raise ValueError(f"无法识别 trace 输入与组别：{path.name}")
+        p, s, group = int(match[1]), int(match[2]), match[3]
+        matching = [r for r in samples if int(r["prefix_length"]) == p
+                    and int(r["suffix_length"]) == s and r["group"] == group]
+        if len(matching) != 1 or matching[0]["valid"] != "True":
+            raise ValueError("每组需恰好一个有效诊断请求，避免 trace 与样本归属歧义")
+        sample = matching[0]
+        with gzip.open(path, "rt") as file:
+            forward, h2d, details = trace_intervals(json.load(file)["traceEvents"])
+        if not forward or bool(h2d) != (group == "l2"):
+            raise ValueError(f"GPU trace 不完整或 H2D Kernel 未识别：{path.name}")
+        if details["forward_input_tokens"] != (p + s if group == "cold" else s):
+            raise ValueError(f"Profiler forward token 数与样本不符：{path.name}")
+        forward_ms = sum(b - a for a, b in forward) / 1000
+        load_ms = sum(b - a for a, b in h2d) / 1000
+        overlap_ms = overlap_duration(forward, h2d) / 1000
+        results.append(dict(
+            trace=path.name, prefix_length=p, suffix_length=s, group=group,
+            forward_kernel_busy_ms=forward_ms, h2d_kernel_busy_ms=load_ms,
+            h2d_kernel_span_ms=(h2d[-1][1] - h2d[0][0]) / 1000 if h2d else 0.,
+            overlap_ms=overlap_ms, h2d_without_forward_kernel_ms=load_ms - overlap_ms,
+            prefill_forward_gpu_ms=sample.get(FORWARD_FIELD), kv_load_ms=sample["kv_load_ms"],
+            **details,
+        ))
+        timelines.append((group, forward, h2d))
+    if len(results) != len(samples):
+        raise ValueError("trace 数量与诊断样本数量不符")
+    write_json(directory / "profile_summary.json", results)
+    with (directory / "profile_summary.csv").open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(results[0]))
+        writer.writeheader()
+        writer.writerows(results)
+    if not no_plot:
+        os.environ.setdefault("MPLCONFIGDIR", str(directory.resolve() / ".matplotlib"))
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(len(timelines), 1, figsize=(11, 3 * len(timelines)), squeeze=False)
+        for ax, (group, forward, h2d) in zip(axes[:, 0], timelines):
+            origin = min(a for a, _ in forward + h2d)
+            for y, intervals, label, color in (
+                (1, forward, "Forward kernels", "tab:blue"), (0, h2d, "KV H2D kernels", "tab:orange"),
+            ):
+                ax.broken_barh([((a - origin) / 1000, (b - a) / 1000) for a, b in intervals],
+                               (y - .3, .6), facecolors=color, label=label)
+            ax.set(title=group, yticks=[0, 1], yticklabels=["KV H2D", "Forward"], xlabel="GPU timeline (ms)")
+            ax.grid(axis="x", alpha=.3)
+        note = config["arguments"].get("note", "")
+        title = "Profiler diagnostic: actual kernel intervals; each panel has its own time scale"
+        fig.suptitle(title + ("\n" + note if note else ""))
+        fig.tight_layout()
+        fig.savefig(directory / "profile_timeline.png", dpi=180)
+        plt.close(fig)
+    print(f"Trace analysis: {directory / 'profile_summary.csv'}")
 
 
 def run(args):
@@ -520,6 +1173,13 @@ def run(args):
         write_json(directory / "inputs.json", dict(text=text, cases=cases))
         with (directory / "responses.jsonl").open("w") as events:
             client = Client(args.base_url, args.timeout, events)
+            if args.telemetry_dir:
+                client.environment = EnvironmentMonitor(Path(args.telemetry_dir))
+            if args.profile:
+                client.profile_dir = directory.resolve() / "traces"
+                client.profile_dir.mkdir()
+                # 服务进程与 Driver UID 不同；NFS root-squash 下只开放本次 trace 目录。
+                client.profile_dir.chmod(0o777)
             # 3. 等待模型加载及服务预热结束；启动期间的 503 不算实验失败。
             deadline = time.monotonic() + args.ready_timeout
             while True:
@@ -542,7 +1202,17 @@ def run(args):
                 model=model_info.get("model_path", info.get("model_path")),
             )
             # 4. 按实际服务配置检查输入是否合法，再进入测量。
-            check_server(info, cases, args.output_length)
+            check_server(info, cases, args.output_length, args.groups)
+            client.hicache = bool(info.get("enable_hierarchical_cache"))
+            if args.gpu_timing:
+                if not client.hicache:
+                    raise ValueError("GPU 时间归属依赖 HiCache 空闲检查，请启用 HICACHE=1")
+                # 短请求建立原生 extend 指标，并等完成后读取；不进入采样 CSV。
+                client.generate(cases[0]["prefix"][:32], 1, "timing_init")
+                client.wait_cache(cases[0]["prefix"][:32])
+                client.gpu_timing = True
+                client.load_metrics("timing_init_metrics")
+            config["phase"] = "cold_l1_l2_hicache" if client.hicache else "cold_l1_no_hicache"
             common = dict(
                 model=config["model"],
                 dtype=info.get("dtype"),
@@ -714,7 +1384,216 @@ def self_test():
         relevant = [r for r in summary if r["group"] == rows[0]["group"]]
         assert all(r["invalid"] == "1" and r["valid"] == "3" for r in relevant)
         assert next(r for r in relevant if r["metric"] == "client_latency_ms")["p95"] == "3.0"
-    print("PASS: exact prefixes, reset/preparation, repeat isolation, invalid samples, CSV and quantiles")
+    # L2 模拟只验证 Driver 的协议与指标归属，不替代真实树/allocator 测试。
+    class FakeHiCacheClient(FakeClient):
+        hicache = True
+
+        def __init__(self):
+            super().__init__()
+            self.backed = []
+            self.demoted = False
+            self.counters = dict.fromkeys(LOAD_FIELDS, 0)
+
+        def flush(self):
+            super().flush()
+            self.backed = []
+            self.demoted = False
+
+        def wait_cache(self, prefix_ids, *, demote=False):
+            if demote:
+                self.cached = []
+                self.demoted = True
+            def shared(ids):
+                return next(
+                    (i for i, (a, b) in enumerate(zip(ids, prefix_ids)) if a != b),
+                    min(len(ids), len(prefix_ids)),
+                )
+            device, host = shared(self.cached), shared(self.backed)
+            return dict(
+                device_tokens=device, host_backed_tokens=host,
+                host_hit_tokens=host - device, backup_complete=host == len(prefix_ids),
+                device_used_tokens=len(self.cached), host_used_tokens=len(self.backed),
+                kv_bytes_per_token=16,
+            )
+
+        def load_metrics(self, stage):
+            return self.counters.copy()
+
+        def generate(self, ids, output_length, stage):
+            was_demoted = self.demoted
+            if was_demoted:
+                self.cached = self.backed.copy()
+            response, elapsed, rid = super().generate(ids, output_length, stage)
+            response["output_ids"] = [1] * output_length
+            hit = response["meta_info"]["cached_tokens"]
+            if was_demoted:
+                response["meta_info"]["cached_tokens_details"] = dict(device=0, host=hit)
+                self.counters["kv_load_ms"] += .25
+                self.counters["kv_load_tokens"] += hit
+                self.counters["kv_load_bytes"] += hit * 16
+                self.counters["kv_load_ops"] += 1
+            self.backed = ids.copy()
+            self.demoted = False
+            return response, elapsed, rid
+
+    hi_args = SimpleNamespace(**{**vars(args), "groups": ["cold", "l1", "l2"], "repeats": 2})
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=FIELDS)
+    writer.writeheader()
+    run_samples(FakeHiCacheClient(), [c], hi_args, writer, output, {})
+    hi_rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+    assert len(hi_rows) == 6 and all(r["valid"] == "True" for r in hi_rows)
+    for row in hi_rows:
+        expected = 8 if row["group"] == "l2" else 0
+        assert int(row["kv_load_tokens"]) == expected
+        assert int(row["kv_load_bytes"]) == expected * 16
+        assert int(row["device_tokens_before"]) == (8 if row["group"] == "l1" else 0)
+
+    class WrongOutputClient(FakeHiCacheClient):
+        def generate(self, ids, output_length, stage):
+            is_l2 = self.demoted
+            response, elapsed, rid = super().generate(ids, output_length, stage)
+            if is_l2 and stage == "measure":
+                response["output_ids"] = [999] * output_length
+            return response, elapsed, rid
+
+    # 即使命中和传输量正确，L2 生成结果不一致也不能收为有效样本。
+    wrong_args = SimpleNamespace(**{**vars(hi_args), "repeats": 1, "max_attempts": 1})
+    wrong_output = io.StringIO()
+    wrong_writer = csv.DictWriter(wrong_output, fieldnames=FIELDS)
+    wrong_writer.writeheader()
+    try:
+        run_samples(WrongOutputClient(), [c], wrong_args, wrong_writer, wrong_output, {})
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("生成结果不一致时仍完成了实验")
+    wrong_rows = list(csv.DictReader(io.StringIO(wrong_output.getvalue())))
+    assert any(r["valid"] == "False" and "token" in r["invalid_reason"] for r in wrong_rows)
+    labels = 'cache_type="unified",tp_rank="0",pp_rank="0",dp_rank="0"'
+    text = (
+        f'sglang:load_back_tokens_total{{{labels},pool="kv"}} 8\n'
+        f'sglang:load_back_bytes_total{{{labels}}} 128\n'
+        f'sglang:load_back_duration_seconds_sum{{{labels}}} .00025\n'
+        f'sglang:load_back_duration_seconds_count{{{labels}}} 1\n'
+    )
+    parsed = parse_load_metrics(text)
+    zero = dict.fromkeys(LOAD_FIELDS, 0)
+    assert parsed == dict(kv_load_ms=.25, kv_load_tokens=8, kv_load_bytes=128, kv_load_ops=1)
+    assert not load_deltas(zero, parsed, 8, 16, "l2")[1]
+    assert load_deltas(parsed, zero, 8, 16, "l2")[1]  # 指标重置。
+    assert load_deltas(zero, parsed, 8, 16, "l1")[1]  # L1 中出现 H2D。
+    assert load_deltas(zero, {**parsed, "kv_load_bytes": 64}, 8, 16, "l2")[1]
+    for invalid in (text + text, "", text.replace('tp_rank="0"', 'tp_rank="1"'),
+                    text.replace(' .00025', ' NaN')):
+        try:
+            parse_load_metrics(invalid)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("无效指标被接受")
+    forward_labels = 'engine_type="unified",model_name="/model",moe_ep_rank="0",pp_rank="0",tp_rank="0"'
+    forward = f'sglang:forward_execution_seconds_total{{{forward_labels},category="extend"}} .123\n'
+    assert math.isclose(parse_forward_metric(forward), 123)
+    for invalid in ("", forward + forward, forward.replace(".123", "NaN"),
+                    forward.replace('tp_rank="0"', 'tp_rank="1"'),
+                    forward.replace('category="extend"', 'category="decode"')):
+        try:
+            parse_forward_metric(invalid)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("无效的 GPU forward 指标被接受")
+    # 区间须先取并集再算交集；并发 Kernel 不能重复累计为 GPU 忙碌时间。
+    assert merge_intervals([(1, 4), (2, 3), (4, 6), (8, 9)]) == [(1, 6), (8, 9)]
+    assert overlap_duration([(1, 6), (8, 9)], [(3, 8.5)]) == 3.5
+    trace = [
+        dict(cat="user_annotation", name="step[EXTEND bs=1 toks=128]", pid=1, tid=1, ts=100, dur=100),
+        dict(cat="cuda_runtime", pid=1, tid=1, ts=110, dur=2, args=dict(correlation=7)),
+        dict(cat="cuda_runtime", pid=1, tid=2, ts=110, dur=2, args=dict(correlation=9)),
+        dict(cat="kernel", name="gemm", ts=150, dur=30, args=dict(device=0, correlation=7)),
+        dict(cat="kernel", name="hicache_transfer_per_layer", ts=140, dur=30, args=dict(device=0, correlation=8)),
+        dict(cat="kernel", name="hicache_relayout_kernel", ts=190, dur=20, args=dict(device=0, correlation=9)),
+    ]
+    forward, load, details = trace_intervals(trace)
+    assert forward == [(150, 180)] and load == [(140, 170)]
+    assert details["forward_input_tokens"] == 128 and overlap_duration(forward, load) == 20
+    # 重现本轮故障：GPU0 丢失时仍保留 GPU3；实验卡自身故障必须拒绝。
+    class FakeNVML:
+        class NVMLError(Exception):
+            pass
+        NVML_TEMPERATURE_GPU, NVML_CLOCK_SM, NVML_CLOCK_MEM = 0, 0, 1
+        def nvmlDeviceGetCount(self): return 4
+        def nvmlDeviceGetHandleByIndex(self, index):
+            if index == 0: raise self.NVMLError("GPU0 lost")
+            return index
+        def nvmlDeviceGetUtilizationRates(self, handle): return SimpleNamespace(gpu=0, memory=0)
+        def nvmlDeviceGetMemoryInfo(self, handle): return SimpleNamespace(used=1, total=48)
+        def nvmlDeviceGetComputeRunningProcesses(self, handle): return [SimpleNamespace(pid=42, usedGpuMemory=1)]
+        def nvmlDeviceGetUUID(self, handle): return f"GPU-{handle}"
+    sampled = sample_gpu_devices(FakeNVML(), 3)
+    assert sampled["ok"] and not sampled["gpus"]["0"]["ok"]
+    assert sampled["gpus"]["3"]["compute_processes"] == [dict(pid=42, used_bytes=1)]
+    assert not sample_gpu_devices(FakeNVML(), 0)["ok"]
+    assert not sample_gpu_devices(FakeNVML(), 9)["ok"]
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        write_json(directory / "owner.json", dict(gpu_index=3,allowed_gpu_pids=[42],scheduler_pid=42))
+        base = time.monotonic_ns() - 10_000_000_000
+        window = dict(measurement_start_monotonic_ns=base+1_200_000_000,
+                      measurement_end_monotonic_ns=base+1_400_000_000)
+        def telemetry(kind, bad_pid=False, failed=False, gap=False):
+            moments = [base,base+4_000_000_000] if gap else [base+i*1_000_000_000 for i in range(4)]
+            records = [dict(ok=not failed,end_monotonic_ns=t,duration_ms=2.,
+                            gpus={"3":dict(compute_processes=[dict(pid=99 if bad_pid else 42)])}) for t in moments]
+            (directory / f"{kind}.jsonl").write_text("".join(json.dumps(r)+"\n" for r in records))
+        telemetry("gpu");telemetry("host")
+        assert EnvironmentMonitor(directory).evaluate(window)["environment_valid"]
+        records = [dict(sampled, end_monotonic_ns=base+i*1_000_000_000, duration_ms=2.) for i in range(4)]
+        (directory / "gpu.jsonl").write_text("".join(json.dumps(r)+"\n" for r in records))
+        assert EnvironmentMonitor(directory).evaluate(window)["environment_valid"]
+        for record in records:
+            record.update(ok=False, gpus={"3":dict(ok=False, error="lost")})
+        (directory / "gpu.jsonl").write_text("".join(json.dumps(r)+"\n" for r in records))
+        assert not EnvironmentMonitor(directory).evaluate(window)["environment_valid"]
+        telemetry("gpu",bad_pid=True)
+        assert not EnvironmentMonitor(directory).evaluate(window)["environment_valid"]
+        telemetry("gpu");telemetry("host",failed=True)
+        assert not EnvironmentMonitor(directory).evaluate(window)["environment_valid"]
+        telemetry("host");telemetry("gpu",gap=True)
+        assert not EnvironmentMonitor(directory).evaluate(window)["environment_valid"]
+        telemetry("gpu")
+        reader = EnvironmentMonitor(directory)
+        reader.refresh()
+        record = dict(ok=True,end_monotonic_ns=base+5_000_000_000,duration_ms=1.,
+                      gpus={"3":dict(compute_processes=[dict(pid=42)])})
+        encoded = (json.dumps(record)+"\n").encode()
+        with (directory/'gpu.jsonl').open('ab') as file:
+            file.write(encoded[:30])
+        reader.refresh()
+        assert len(reader.records['gpu'])==4
+        with (directory/'gpu.jsonl').open('ab') as file:
+            file.write(encoded[30:])
+        reader.refresh()
+        assert len(reader.records['gpu'])==5
+    class FakeEnvironment:
+        def __init__(self):self.calls=0
+        def wait_ready(self):pass
+        def evaluate(self, window):
+            self.calls += 1
+            return dict(environment_valid=self.calls>1,environment_reason="injected gap" if self.calls==1 else "")
+    env_client = FakeHiCacheClient()
+    env_client.environment = FakeEnvironment()
+    env_args = SimpleNamespace(**{**vars(hi_args),"groups":["l1"],"repeats":1,"max_attempts":3})
+    output=io.StringIO();writer=csv.DictWriter(output,fieldnames=FIELDS);writer.writeheader()
+    run_samples(env_client,[c],env_args,writer,output,{})
+    attempts=list(csv.DictReader(io.StringIO(output.getvalue())))
+    assert len(attempts)==2 and attempts[0]['cache_valid']=='True' and attempts[0]['valid']=='False'
+    assert attempts[1]['valid']=='True'
+    formal=summarize_rows(attempts,dict(arguments=vars(env_args)),['client_latency_ms'])
+    unfiltered=summarize_rows(attempts,dict(arguments=vars(env_args)),['client_latency_ms'],'cache_valid')
+    assert formal[0]['valid']==1 and formal[0]['invalid']==1 and unfiltered[0]['valid']==2
+    print("PASS: cache preparation/hits, counters, trace attribution, telemetry gaps/processes, retained attempts, CSV and quantiles (mock clients only)")
 
 
 def main():
@@ -723,7 +1602,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     # run：服务由 launch_server.sh 单独启动，这里只连接服务并执行实验。
-    p = sub.add_parser("run", help="在独占的 TP=1 服务上测量 Cold/L1，需关闭 HiCache")
+    p = sub.add_parser("run", help="在独占 TP=1 服务上测量 Cold/L1，或开启 HiCache 后测三组")
     p.add_argument(
         "--base-url", default="http://127.0.0.1:39081", help="SGLang HTTP 服务地址"
     )
@@ -741,8 +1620,8 @@ def main():
         "--output-length", type=positive_length, default=1, help="每个测量请求生成的 token 数"
     )
     p.add_argument(
-        "--groups", nargs="+", choices=["cold", "l1"], default=["cold", "l1"],
-        help="测量哪些缓存组，默认同时测 Cold 和 L1",
+        "--groups", nargs="+", choices=["cold", "l1", "l2"], default=["cold", "l1"],
+        help="测量哪些缓存组；L2 需要开启 HiCache 和实验接口",
     )
     p.add_argument(
         "--repeats", type=positive_length, default=20, help="每个 P/S/缓存组所需的有效样本数"
@@ -755,22 +1634,37 @@ def main():
         "--warmup-rounds", type=positive_length, default=1,
         help="每个 P/S 组合的运行预热轮数，不计入有效样本",
     )
-    p.add_argument("--seed", type=int, default=0, help="控制两组执行顺序的随机种子")
+    p.add_argument("--seed", type=int, default=0, help="控制各组执行顺序的随机种子")
     p.add_argument("--text-file", help="固定 UTF-8 前缀文本；省略时使用内置英文笔记")
     p.add_argument("--timeout", type=positive_length, default=600, help="单次 HTTP 请求超时，单位秒")
     p.add_argument("--ready-timeout", type=positive_length, default=600, help="等待服务就绪的上限，单位秒")
     p.add_argument("--no-plot", action="store_true", help="保存 CSV 汇总但不绘图")
+    p.add_argument("--profile", action="store_true", help="只在测量请求期间采集 CPU/GPU trace；结果含 Profiler 开销，仅用于诊断")
+    p.add_argument("--gpu-timing", action="store_true", help="记录原生 extend CUDA Event 区间；服务需 FORWARD_TIMING=1，区间可能包含等待")
+    p.add_argument("--note", default="", help="保存在配置和图中的实验说明，例如未缩放 RoPE 外推；不影响请求内容")
+    p.add_argument("--telemetry-dir", help="宿主机采样目录；启用后关联请求窗口，监控缺口或额外 GPU 进程不计入正式有效数")
 
     # analyze：只读取现有结果，适合调整图表或重新检查统计。
     p = sub.add_parser("analyze", help="从已保存样本重新汇总和绘图，无需服务或 GPU")
     p.add_argument("directory", type=Path, help="包含 config.json 和 samples.csv 的结果目录")
     p.add_argument("--no-plot", action="store_true", help="只重新生成汇总 CSV")
     sub.add_parser("self-test", help="用模拟数据自测逻辑，无需第三方依赖或 GPU")
+    p = sub.add_parser("monitor", help="宿主机独立采样进程；GPU 与主机各启动一个")
+    p.add_argument("--kind", choices=["gpu", "host"], required=True)
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--interval", type=float, default=1.)
+    p = sub.add_parser("analyze-traces", help="分析三组各一次的诊断 trace，统计计算/H2D 忙碌区间与重叠")
+    p.add_argument("directory", type=Path, help="完整的 --profile 运行目录")
+    p.add_argument("--no-plot", action="store_true", help="仅保存 trace 汇总，不绘图")
     args = parser.parse_args()
     if args.command == "self-test":
         self_test()
+    elif args.command == "monitor":
+        monitor(args)
     elif args.command == "analyze":
         analyze(args.directory, args.no_plot)
+    elif args.command == "analyze-traces":
+        analyze_traces(args.directory, args.no_plot)
     else:
         # 保留用户给出的顺序并去重，避免同一组合被无意重复测量。
         for key in ("prefix_lengths", "suffix_lengths", "groups"):

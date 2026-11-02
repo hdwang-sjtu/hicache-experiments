@@ -14,6 +14,8 @@ CONTAINER_NAME="${CONTAINER_NAME:-hicache-exp-$(id -u)-$RUN_ID}"
 IMAGE="${IMAGE:-lmsysorg/sglang:latest}"
 GPU="${GPU:-1}"
 PORT="${PORT:-39081}"
+HICACHE="${HICACHE:-0}"
+FORWARD_TIMING="${FORWARD_TIMING:-0}"
 
 # --help 和 --dry-run 都不会启动容器，适合先检查用法与最终命令。
 if [[ ${1:-} == --help ]]; then
@@ -30,10 +32,13 @@ if [[ ${1:-} == --help ]]; then
   CONTEXT_LENGTH          最大上下文长度
   MAX_TOTAL_TOKENS        GPU KV 池的 token 容量上限
   MEM_FRACTION            SGLang 的静态显存预算比例
+  HICACHE / HICACHE_SIZE   设为 1 开启 L2 实验 / CPU KV 池大小（默认 8 GB，十进制）
+  FORWARD_TIMING          设为 1 启用原生 CUDA Event forward 指标（默认关闭）
 
 示例：
   bash launch_server.sh --dry-run
   GPU=1 RUN_ID=baseline-8k bash launch_server.sh
+  GPU=1 HICACHE=1 RUN_ID=l2-8k bash launch_server.sh
   MODEL_DIR=/path/to/model DTYPE=float16 bash launch_server.sh
 
 额外参数会追加到 SGLang 启动命令；镜像和模型需提前在本机准备好。
@@ -46,6 +51,15 @@ if [[ ${1:-} == --dry-run ]]; then
     shift
 fi
 [[ ${1:-} != -- ]] || shift
+[[ "$HICACHE" == 0 || "$HICACHE" == 1 ]] || {
+    echo 'HICACHE must be 0 or 1.' >&2
+    exit 2
+}
+[[ "$FORWARD_TIMING" == 0 || "$FORWARD_TIMING" == 1 ]] || exit 2
+if [[ "$FORWARD_TIMING" == 1 && "$HICACHE" != 1 ]]; then
+    echo 'FORWARD_TIMING=1 需要 HICACHE=1，以便 Driver 在指标快照前确认空闲。' >&2
+    exit 2
+fi
 
 # RUN_ID 只允许单层目录名，避免结果被写到预期目录之外。
 [[ "$RUN_ID" =~ ^[a-zA-Z0-9_.-]+$ && "$RUN_ID" != . && "$RUN_ID" != .. ]] || {
@@ -61,7 +75,7 @@ MODEL_DIR="$(cd "$MODEL_DIR" && pwd)"
 [[ "$RESULTS_DIR" == /* ]] || RESULTS_DIR="$PWD/$RESULTS_DIR"
 
 # 2. 组装命令。使用 Bash 数组，确保路径含空格时仍是一个完整参数。
-#    阶段 1：只测 Cold/L1；单卡、单请求，保留 overlap 和 chunked prefill。
+#    单卡、单请求，保留 overlap 和 chunked prefill；三组使用同一服务配置。
 #    --enable-metrics 用于返回现有服务端时间，两个 Graph 开关保持配置一致。
 server_args=(python -m sglang.launch_server
     --model-path /model --host 127.0.0.1 --port "$PORT"
@@ -73,8 +87,19 @@ server_args=(python -m sglang.launch_server
     --max-running-requests 1 --chunked-prefill-size 4096 --page-size 1
     --enable-metrics --return-output-ids
     --cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled
-    "$@"
 )
+experiment_groups=(cold l1)
+if [[ "$HICACHE" == 1 ]]; then
+    # 三组都在同一个开启 HiCache 的服务上运行，避免比较不同服务配置。
+    server_args+=(
+        --enable-hierarchical-cache --enable-hicache-experiment
+        --hicache-host-memory-mode cache --hicache-write-policy write_through
+        --hicache-size "${HICACHE_SIZE:-8}"
+        --hicache-io-backend kernel --hicache-mem-layout page_first
+    )
+    experiment_groups+=(l2)
+fi
+server_args+=("$@")
 
 # 源码、权重和实验脚本只读挂载；只有 /results 可写。
 # PYTHONPATH 确保服务使用当前 checkout 的源码，而不是镜像自带的源码。
@@ -89,8 +114,17 @@ docker_args=(docker run --detach --rm --name "$CONTAINER_NAME" --pull never
     --env "PYTHONPATH=/sgl-workspace/sglang/python"
     --env "SGLANG_SOURCE_DIR=/sgl-workspace/sglang"
     --env "EXPERIMENT_LAUNCH_DIR=/results/$RUN_ID"
+    --env "SGLANG_ENABLE_METRICS_DEVICE_TIMER=$FORWARD_TIMING"
     --env "HF_HUB_OFFLINE=1" --env "TRANSFORMERS_OFFLINE=1" --entrypoint /usr/bin/env
 )
+if [[ "$HICACHE" == 1 ]]; then
+    # 首版定向逐出只支持 Python TreeCore，显式固定以免工具链变化切换后端。
+    docker_args+=(--env "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python")
+fi
+driver_timing_args=()
+if [[ "$FORWARD_TIMING" == 1 ]]; then
+    driver_timing_args+=(--gpu-timing)
+fi
 
 if "$dry_run"; then
     printf '%q ' "${docker_args[@]}" "$IMAGE" "${server_args[@]}"
@@ -154,7 +188,7 @@ echo '在另一个宿主机终端执行以下命令，运行 8K 小规模验证�
 printf '%q ' docker exec --user "$(id -u):$(id -g)" "$CONTAINER_NAME" \
     python /experiment/run_experiment.py run --base-url "http://127.0.0.1:$PORT" \
     --tokenizer /model --output-dir "/results/$RUN_ID" \
-    --prefix-lengths 8k --suffix-lengths 128 --repeats 3
+    --prefix-lengths 8k --suffix-lengths 128 --groups "${experiment_groups[@]}" --repeats 3 "${driver_timing_args[@]}"
 printf '\n'
 # 同时在终端显示日志、在宿主机保存日志；Ctrl-C 会触发上面的清理函数。
 docker logs --follow "$container_id" 2>&1 | tee "$run_dir/server.log"
