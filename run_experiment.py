@@ -1141,7 +1141,7 @@ def attach_server_artifacts(directory, launch_dir, config):
     config["launch"] = json.loads(manifest.read_text())
     config["server_log_path"] = str(launch_dir / "server.log")
     if launch_dir != directory.resolve():
-        for name in ("launch.json", "sglang.patch", "gpu.txt"):
+        for name in ("launch.json", "sglang.patch", "gpu.txt", "profile.yaml", "server-config.yaml", "profile-resolution.json"):
             if (launch_dir / name).is_file():
                 shutil.copyfile(launch_dir / name, directory / name)
         if (launch_dir / "launch-source").is_dir():

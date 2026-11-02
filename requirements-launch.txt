@@ -1,0 +1,2 @@
+# 仅命名 YAML 配置需要；宿主机无需安装 SGLang 或 Torch。
+PyYAML>=6,<7

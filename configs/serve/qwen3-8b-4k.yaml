@@ -1,0 +1,35 @@
+# 模型目录为 $MODEL_ROOT/Qwen3-8B，也可用 MODEL_DIR 临时指定完整路径。
+model: Qwen3-8B
+
+env:
+  SGLANG_ENABLE_METRICS_DEVICE_TIMER: "1"
+  SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND: python
+
+sglang:
+  # 总上下文 4K，包含历史 P、新增 S 和输出；KV 池另留预热后缀分支空间。
+  context-length: 4096
+  max-total-tokens: 8192
+  dtype: bfloat16
+  kv-cache-dtype: bfloat16
+  tp-size: 1
+  host: 127.0.0.1
+  port: 39081
+  mem-fraction-static: 0.7
+
+  # 保持单请求、分页和分块策略；不启用 CUDA Graph，保留默认 overlap。
+  max-running-requests: 1
+  chunked-prefill-size: 4096
+  page-size: 1
+  cuda-graph-backend-decode: disabled
+  cuda-graph-backend-prefill: disabled
+  enable-metrics: true
+  return-output-ids: true
+
+  # CPU L2；需要配套 SGLang 实验补丁，不配置 L3。
+  enable-hierarchical-cache: true
+  enable-hicache-experiment: true
+  hicache-host-memory-mode: cache
+  hicache-write-policy: write_through
+  hicache-size: 8  # 十进制 GB
+  hicache-io-backend: kernel
+  hicache-mem-layout: page_first

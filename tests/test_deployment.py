@@ -1,6 +1,7 @@
 """无 GPU 回归：真实脚本/HTTP/进程边界，服务与 Docker 使用替身。"""
 
 import csv
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -49,6 +50,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         smi.write_text("#!/bin/sh\nprintf 'test GPU, no real device access\\n'\n")
         smi.chmod(0o755)
         self.env = {k: v for k, v in os.environ.items() if k not in (
+            "MODEL_ROOT",
             "GPU", "HOST", "PORT", "HICACHE", "HICACHE_SIZE", "FORWARD_TIMING", "TP", "DTYPE",
             "KV_DTYPE", "CONTEXT_LENGTH", "MAX_TOTAL_TOKENS", "MEM_FRACTION", "PYTHONPATH",
             "CUDA_VISIBLE_DEVICES", "SGLANG_ENABLE_METRICS_DEVICE_TIMER", "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND",
@@ -132,7 +134,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         self.assertEqual(a, b)
         self.assertFalse((self.root / "results").exists())
 
-    def test_docker_propagates_exit_and_cleans_only_owned_container(self):
+    def fake_docker(self):
         docker = self.bin / "docker"
         docker.write_text('''#!/usr/bin/env python3
 import json, os, sys
@@ -145,6 +147,10 @@ elif command[0] == 'wait': print('17')
 ''')
         docker.chmod(0o755)
         log = self.root / "docker.jsonl"
+        return log
+
+    def test_docker_propagates_exit_and_cleans_only_owned_container(self):
+        log = self.fake_docker()
         result = self.run_script("launch_server.sh", FAKE_DOCKER_LOG=str(log))
         self.assertEqual(result.returncode, 17, result.stderr)
         calls = [json.loads(line) for line in log.read_text().splitlines()]
@@ -152,6 +158,71 @@ elif command[0] == 'wait': print('17')
         manifest = json.loads((self.root / "results/test/launch.json").read_text())
         self.assertEqual(manifest["image_id"], "sha256:fixed-image")
         self.assertNotIn("packages", manifest)
+
+    def test_named_native_profile_snapshot_and_cli_override(self):
+        literal = json.dumps({"text": "$(touch SHOULD_NOT_EXIST); `echo nope`", "max_position_embeddings": 4096})
+        result = self.run_script("serve.sh", "qwen3-8b-4k", "--mem-fraction-static", "0.85",
+                                 "--json-model-override-args", literal, MEM_FRACTION="0.75")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        directory = self.root / "results/test"
+        capture = json.loads((self.root / "capture.json").read_text())
+        self.assertEqual(capture["timer"], "1")
+        self.assertEqual(capture["args"], ["--config", str(directory / "server-config.yaml"),
+                                        "--mem-fraction-static", "0.85", "--json-model-override-args", literal])
+        resolution = json.loads((directory / "profile-resolution.json").read_text())
+        self.assertEqual(resolution["server"]["context-length"], 4096)
+        self.assertEqual(resolution["server"]["mem-fraction-static"], .75)
+        self.assertEqual(resolution["server"]["model-path"], str(self.model))
+        manifest = json.loads((directory / "launch.json").read_text())
+        raw = (PROJECT / "configs/serve/qwen3-8b-4k.yaml").read_bytes()
+        self.assertEqual((directory / "profile.yaml").read_bytes(), raw)
+        self.assertEqual(manifest["profile"]["source_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(manifest["profile"]["server_config_sha256"],
+                         hashlib.sha256((directory / "server-config.yaml").read_bytes()).hexdigest())
+        # 已冻结的配置不再次读取当下的环境覆盖。
+        frozen = self.run_script("serve.sh", "--exec", "--resolved-profile",
+                                 str(directory / "profile-resolution.json"), HICACHE="0", FORWARD_TIMING="0")
+        self.assertEqual(frozen.returncode, 0, frozen.stderr)
+        self.assertEqual(json.loads((self.root / "capture.json").read_text())["timer"], "1")
+        self.assertFalse((PROJECT / "SHOULD_NOT_EXIST").exists())
+
+    def test_named_docker_profile_freezes_config_and_rewrites_model(self):
+        log = self.fake_docker()
+        result = self.run_script("launch_server.sh", "qwen3-8b-4k", "--model", str(self.model),
+                                 "--mem-fraction-static", "0.85", FAKE_DOCKER_LOG=str(log))
+        self.assertEqual(result.returncode, 17, result.stderr)
+        directory = self.root / "results/test"
+        resolution = json.loads((directory / "profile-resolution.json").read_text())
+        self.assertEqual(resolution["server"]["model-path"], "/model")
+        self.assertEqual(resolution["cli_args"], ["--mem-fraction-static", "0.85"])
+        self.assertEqual(resolution["model_directory"], str(self.model))
+        manifest = json.loads((directory / "launch.json").read_text())
+        self.assertEqual(manifest["command"][-2:], ["--resolved-profile", "/results/test/profile-resolution.json"])
+        self.assertIn(f"type=bind,src={self.model},dst=/model,readonly", manifest["command"])
+
+    def test_profile_listing_and_preview_need_no_model_or_gpu(self):
+        for script in ("serve.sh", "launch_server.sh"):
+            listed = self.run_script(script, "--list-configs", MODEL_DIR="")
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            self.assertIn("qwen3-8b-4k", listed.stdout)
+            for args in (["qwen3-8b-4k", "--dry-run"], ["--dry-run", "qwen3-8b-4k"]):
+                result = self.run_script(script, *args, MODEL_DIR="", MODEL_ROOT="/not downloaded yet")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("context-length: 4096", result.stdout)
+                self.assertIn("/not downloaded yet/Qwen3-8B", result.stdout)
+        self.assertFalse((self.root / "results").exists())
+
+    def test_bad_profile_fails_before_docker_or_server(self):
+        log = self.fake_docker()
+        for script in ("serve.sh", "launch_server.sh"):
+            bad_name = self.run_script(script, "not-an-existing-profile", FAKE_DOCKER_LOG=str(log))
+            self.assertNotEqual(bad_name.returncode, 0)
+            self.assertIn("--list-configs", bad_name.stderr)
+            missing = self.run_script(script, "qwen3-8b-4k", MODEL_DIR="", MODEL_ROOT="", FAKE_DOCKER_LOG=str(log))
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("MODEL_ROOT", missing.stderr)
+        self.assertFalse(log.exists())
+        self.assertFalse((self.root / "capture.json").exists())
 
 
 class RemoteClient(unittest.TestCase):

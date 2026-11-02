@@ -4,10 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ ${1:-} == --help ]]; then
     cat <<'HELP'
-用法：MODEL_DIR=/path/to/model [环境变量=值 ...] bash launch_server.sh [--dry-run] [SGLang 参数 ...]
+用法：bash launch_server.sh [配置名] [--dry-run] [SGLang 参数 ...]
+  MODEL_ROOT=/models GPU=0 bash launch_server.sh qwen3-8b-4k
+  bash launch_server.sh --list-configs
+无配置名时兼容 MODEL_DIR=/path/to/model bash launch_server.sh。
 需要宿主机 Docker + NVIDIA runtime、本地已有镜像和模型。
 已有 SGLang 环境（包括 Vast 普通容器）请直接用 bash serve.sh。
-  MODEL_DIR / SGLANG_DIR    宿主机模型 / 源码目录；显式 SGLANG_DIR='' 使用镜像安装包
+  MODEL_ROOT / MODEL_DIR   模型根目录 / 完整模型目录覆盖（均为宿主机路径）
+  SGLANG_DIR               源码目录；显式 SGLANG_DIR='' 使用镜像安装包
   IMAGE                    默认 lmsysorg/sglang:latest，启动前固定为本地镜像 ID
   GPU                      宿主机 GPU 编号或 UUID，默认 0
   RESULTS_DIR / RUN_ID      宿主机结果根目录 / 本轮启动目录名
@@ -19,9 +23,29 @@ HELP
     exit 0
 fi
 dry_run=false
-if [[ ${1:-} == --dry-run ]]; then dry_run=true; shift; fi
-[[ ${1:-} != -- ]] || shift
-MODEL_DIR="${MODEL_DIR:?请设置 MODEL_DIR 为宿主机模型目录}"
+profile=""
+while (($#)); do
+    case "$1" in
+        --dry-run) dry_run=true; shift ;;
+        --list-configs) python3 "$SCRIPT_DIR/serve_config.py" list; exit ;;
+        --) shift; break ;;
+        -*) break ;;
+        *) [[ -z "$profile" ]] || { echo '只能选择一个配置名。' >&2; exit 2; }
+           profile="$1"; shift ;;
+    esac
+done
+profile_json=""
+profile_environment=()
+if [[ -n "$profile" ]]; then
+    profile_json="$(python3 "$SCRIPT_DIR/serve_config.py" resolve --runtime docker "$profile" -- "$@")"
+    mapfile -d '' -t values < <(python3 "$SCRIPT_DIR/serve_config.py" unpack <<< "$profile_json")
+    ((${#values[@]} >= 4)) || exit 2
+    MODEL_DIR="${values[0]}"
+    env_count="${values[3]}"
+    profile_environment=("${values[@]:4:env_count}")
+else
+    MODEL_DIR="${MODEL_DIR:?请设置 MODEL_DIR 为宿主机模型目录，或选择命名配置并设置 MODEL_ROOT}"
+fi
 IMAGE="${IMAGE:-lmsysorg/sglang:latest}"
 GPU="${GPU:-0}"
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
@@ -55,12 +79,19 @@ else
     docker_args+=(--env SGLANG_DIR=)
 fi
 # 只传用户设置的参数；默认值统一由 serve.sh 决定。
-for key in HOST PORT TP DTYPE KV_DTYPE CONTEXT_LENGTH MAX_TOTAL_TOKENS MEM_FRACTION \
-    HICACHE HICACHE_SIZE FORWARD_TIMING HF_HUB_OFFLINE TRANSFORMERS_OFFLINE; do
-    [[ ! -v "$key" ]] || docker_args+=(--env "$key=${!key}")
-done
-command=(bash /experiment/serve.sh --exec "$@")
+if [[ -n "$profile_json" ]]; then
+    # 在宿主机解析一次后冻结；容器不再次读取可变配置或宿主机环境变量。
+    for entry in "${profile_environment[@]}"; do docker_args+=(--env "$entry"); done
+    command=(bash /experiment/serve.sh --exec --resolved-profile "/results/$RUN_ID/profile-resolution.json")
+else
+    for key in HOST PORT TP DTYPE KV_DTYPE CONTEXT_LENGTH MAX_TOTAL_TOKENS MEM_FRACTION \
+        HICACHE HICACHE_SIZE FORWARD_TIMING HF_HUB_OFFLINE TRANSFORMERS_OFFLINE; do
+        [[ ! -v "$key" ]] || docker_args+=(--env "$key=${!key}")
+    done
+    command=(bash /experiment/serve.sh --exec "$@")
+fi
 if "$dry_run"; then
+    [[ -z "$profile_json" ]] || python3 "$SCRIPT_DIR/serve_config.py" preview <<< "$profile_json"
     printf '%q ' "${docker_args[@]}" "$IMAGE" "${command[@]}"
     printf '\n'
     exit 0
@@ -74,9 +105,12 @@ mkdir -p "$RESULTS_DIR"
 run_dir="$RESULTS_DIR/$RUN_ID"
 mkdir "$run_dir"
 # 在宿主机写记录，保留 NFS root-squash 下的普通用户写入能力。
+metadata_args=()
+[[ -z "$profile_json" ]] || metadata_args+=(--profile-json "$profile_json")
 python3 "$SCRIPT_DIR/launch_metadata.py" --directory "$run_dir" --runtime docker \
     --model-dir "$MODEL_DIR" --source-dir "$SGLANG_DIR" --gpu "$GPU" \
-    --image-id "$image_id" --image-ref "$IMAGE" -- "${docker_args[@]}" "$image_id" "${command[@]}"
+    --image-id "$image_id" --image-ref "$IMAGE" "${metadata_args[@]}" \
+    -- "${docker_args[@]}" "$image_id" "${command[@]}"
 container_id="$("${docker_args[@]}" "$image_id" "${command[@]}")"
 cleanup() {
     docker stop --time 15 "$container_id" >/dev/null 2>&1 || true
@@ -86,7 +120,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 echo "启动记录：$run_dir；容器：$CONTAINER_NAME"
-echo "客户端连接 http://127.0.0.1:${PORT:-39081}，或在容器内执行 python /experiment/run_experiment.py run ..."
+echo '服务地址见启动配置；客户端通过 --base-url 指定地址，也可在容器内运行 Driver。'
 docker logs --follow "$container_id" 2>&1 | tee "$run_dir/server.log"
 # 删除前取得服务退出码，防止启动崩溃却被报告为成功。
 server_status="$(docker wait "$container_id")"

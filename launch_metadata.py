@@ -60,10 +60,19 @@ def record(args):
             )
         }
     metadata["source_version_available"] = "sglang_commit" in metadata
+    if args.profile_json:
+        profile = json.loads(args.profile_json)
+        (directory / "profile.yaml").write_bytes(profile["source_text"].encode("utf-8"))
+        (directory / "server-config.yaml").write_text(profile["server_yaml"])
+        (directory / "profile-resolution.json").write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n")
+        metadata["profile"] = {
+            key: profile[key] for key in ("name", "source_path", "source_sha256", "environment", "cli_args")
+        }
+        metadata["profile"]["server_config_sha256"] = hashlib.sha256(profile["server_yaml"].encode()).hexdigest()
     snapshot = directory / "launch-source"
     snapshot.mkdir()
     metadata["launcher_sha256"] = {}
-    for name in ("serve.sh", "launch_server.sh", "launch_metadata.py"):
+    for name in ("serve.sh", "launch_server.sh", "launch_metadata.py", "serve_config.py"):
         path = Path(__file__).with_name(name)
         shutil.copyfile(path, snapshot / name)
         metadata["launcher_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -88,5 +97,6 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", default="inherited")
     parser.add_argument("--image-id")
     parser.add_argument("--image-ref")
+    parser.add_argument("--profile-json", help="启动器提供的已解析命名配置")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     record(parser.parse_args())

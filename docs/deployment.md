@@ -8,9 +8,12 @@
 hicache-experiments/
 ├── launch_server.sh       # Docker 包装：镜像、挂载、容器生命周期
 ├── serve.sh               # 当前环境启动：唯一一份 SGLang 参数
+├── configs/serve/         # 按名称选择的可迁移 YAML 配置
+├── serve_config.py        # 内部工具：解析配置与显式覆盖，不导入 SGLang
 ├── launch_metadata.py     # 内部工具：启动记录和源码快照
 ├── run_experiment.py      # HTTP 客户端、校验、统计、绘图；可单独复制
 ├── requirements-client.txt
+├── requirements-launch.txt  # 命名配置的 PyYAML 依赖
 ├── tests/                 # 不需要 GPU 的部署/客户端回归
 ├── docs/experiments/      # 纳入 Git 的逐轮实验记录
 └── results/               # 忽略的原始数据与日志
@@ -20,6 +23,68 @@ SGLang 和模型放在工程外。默认自动使用相邻 `../sglang`；也可�
 显式 `SGLANG_DIR=''` 表示使用 Python 环境/镜像已经安装的包。安装包仍需与实验接口、指标和启动参数兼容。
 CPU L2 定向逐出补丁在 SGLang 提交 `02a56e2b24` 中，官方上游镜像不会自动包含它。
 客户端只需 `run_experiment.py` 和 tokenizer 文件；`--tokenizer` 永远是客户端路径，`--output-dir` 永远写在客户端。
+
+## 命名服务配置
+
+两种入口共用 `configs/serve/<配置名>.yaml`。解析配置只依赖 PyYAML，不需要在 Docker 宿主机安装 SGLang/Torch：
+
+```bash
+python3 -m pip install -r requirements-launch.txt
+export MODEL_ROOT=/workspace/models
+bash serve.sh --list-configs
+bash serve.sh qwen3-8b-4k --dry-run
+bash launch_server.sh qwen3-8b-4k --dry-run
+```
+
+预览不会读取模型、启动容器、访问 GPU 或创建结果目录；列举配置不依赖 PyYAML。
+`--dry-run` 可放配置名前后，应放在追加的 SGLang 参数之前。实际启动时去掉它。
+
+配置包含三个部分，完整示例见 [qwen3-8b-4k.yaml](../configs/serve/qwen3-8b-4k.yaml)：
+
+```yaml
+model: Qwen3-8B
+env:
+  SGLANG_ENABLE_METRICS_DEVICE_TIMER: "1"
+  SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND: python
+sglang:
+  context-length: 4096
+  max-total-tokens: 8192
+  dtype: bfloat16
+  kv-cache-dtype: bfloat16
+  enable-hierarchical-cache: true
+  hicache-size: 8
+```
+
+上面只展示结构，正式文件还包括实验接口、write-through、指标和 Graph 等设置。
+`sglang` 使用原生连字符参数名，布尔值写 `true/false`，JSON 参数可写成 YAML 映射；由 SGLang 原生 `--config` 解析。
+`model` 是相对 `MODEL_ROOT` 的目录名；配置不包含 GPU、镜像或本机绝对模型路径。`env` 接受 `SGLANG_*` 和两个离线开关。
+每个文件是一份完整配置，不提供继承/组合。新增场景时复制示例、修改内容，并使用新的文件名（调用时省略 `.yaml`）。
+
+覆盖顺序为 **命令行 > 显式环境变量 > 文件**，未设置的环境变量不会用旧脚本默认值覆盖配置。
+原有 `HOST/PORT/TP/DTYPE/KV_DTYPE/CONTEXT_LENGTH/MAX_TOTAL_TOKENS/MEM_FRACTION/HICACHE_SIZE` 映射到对应 SGLang 参数；
+`HICACHE` 同时控制 hierarchical-cache 和实验接口，`FORWARD_TIMING` 覆盖 GPU 计时开关。
+关闭 HiCache 时也要关闭依赖它的计时，例如 `HICACHE=0 FORWARD_TIMING=0 bash serve.sh qwen3-8b-4k`。
+SGLang 的启用标志不能写成 `--enable-hierarchical-cache false`；临时关闭使用上述环境变量，或修改 YAML 中的布尔值。
+
+```bash
+MEM_FRACTION=0.75 bash serve.sh qwen3-8b-4k --mem-fraction-static 0.85
+# 最终显存比例为 0.85；环境覆盖和 CLI 都保留在启动记录中。
+
+MODEL_DIR=/another/path/Qwen3-8B bash serve.sh qwen3-8b-4k
+GPU=0 bash launch_server.sh qwen3-8b-4k --model-path /another/path/Qwen3-8B
+```
+
+模型路径顺序为 `--model-path`（含原生别名 `--model`）> `MODEL_DIR` > `MODEL_ROOT/model`。
+CLI/`MODEL_DIR` 的相对路径相对于启动工作目录；Docker 在宿主机解析后挂载到 `/model`，不会向容器透传宿主机路径。
+命名模式不能再叠加另一个 `--config`。GPU、镜像、源码与结果目录仍用原有部署变量。
+
+每次启动保存 `profile.yaml` 原文、`server-config.yaml`（环境覆盖后的实际下发 YAML）、`profile-resolution.json`（路径、运行时环境和 CLI）及 `launch.json` 中的名称/哈希。
+CLI 仍可覆盖下发 YAML，最终命令与覆盖参数一同记录；实际服务配置由 Driver 保存的 `/server_info` 进一步确认。
+Docker 在宿主机解析并冻结配置，容器不再次解析原始文件。`--server-artifacts` 关联启动目录时会一起复制这些记录。
+
+4K 配置的总上下文是 4096 tokens，包含 P、S 和输出；GPU KV 池 8192 为预热后缀分支留余量。
+首次 GPU 验收使用 `--prefix-lengths 2k --suffix-lengths 128 --groups cold l1 l2 --repeats 3 --gpu-timing`，结果目录单独新建。
+当前提供的是配置和 CPU 回归覆盖，GPU 实测结果需在可用机器上另外记录。
 
 ## 已有环境：直接运行
 
@@ -52,8 +117,8 @@ MODEL_DIR=/path/to/Qwen3-8B SGLANG_DIR=/path/to/sglang GPU=0 \
 ```
 
 容器内 `/model`、`/experiment`、可选的 `/sgl-workspace/sglang` 只读；`/results` 可写。
-Docker 入口不再拼装模型参数，而是传递环境变量并调用 `bash /experiment/serve.sh --exec`。
-服务默认值只在 `serve.sh` 定义；额外参数通过 Bash 数组传递，JSON 和带空格的路径保持完整。
+Docker 入口不拼装模型参数；旧模式传递环境变量，命名模式传递冻结的配置，均调用 `serve.sh --exec`。
+无配置名时的默认值仍在 `serve.sh` 定义；额外参数通过 Bash 数组传递，JSON 和带空格的路径保持完整。
 `GPU` 只用于 Docker 设备选择，不把宿主机编号再次传为容器 CUDA 编号。
 
 启动记录由宿主机写入，兼容 NFS root-squash。Docker 内运行 Driver 时仍识别 `EXPERIMENT_LAUNCH_DIR`。

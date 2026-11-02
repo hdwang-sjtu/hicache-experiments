@@ -6,9 +6,10 @@
 
 ## 怎么读这些入口
 
-`serve.sh` 定义唯一一份服务参数：读取配置 → 组装 SGLang 命令 → 保存启动记录 → exec 服务进程。
+`serve.sh` 使用命名 YAML 或旧环境变量模式：读取配置 → 组装 SGLang 命令 → 保存启动记录 → exec 服务进程。
 `launch_server.sh` 负责 Docker 镜像、挂载和生命周期，在容器内调用 `serve.sh`。
-配置模型、精度或显存预算时看 `serve.sh` 的 `server_args`；修改挂载时看 `launch_server.sh` 的 `docker_args`。
+常用服务参数保存在 `configs/serve/`，通过共用的 `serve_config.py` 解析；旧模式默认值仍在 `serve.sh` 的 `server_args`。
+修改挂载时看 `launch_server.sh` 的 `docker_args`。
 两者通过内部工具 `launch_metadata.py` 保存记录。已有 Python 环境直接用 `serve.sh`，不需要 Docker。
 
 `run_experiment.py` 可以按下面的调用顺序阅读：
@@ -90,7 +91,7 @@ JSON/IPC 传入的 token IDs 是 `list`；接口在匹配前转换为 serving �
 
 ## 参数与结果
 
-启动参数通过环境变量修改，额外命令行参数直接追加给 SGLang：
+可使用 [命名服务配置](deployment.md#命名服务配置)，也可继续通过旧环境变量模式启动，额外参数直接追加给 SGLang：
 
 ```bash
 GPU=1 MODEL_DIR=/path/to/local/model DTYPE=bfloat16 KV_DTYPE=bfloat16 \
@@ -99,7 +100,8 @@ GPU=1 MODEL_DIR=/path/to/local/model DTYPE=bfloat16 KV_DTYPE=bfloat16 \
 
 可覆盖 `SGLANG_DIR`、`IMAGE`、`PORT`、`CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION`、`RESULTS_DIR`。
 `TP` 是启动参数；目前 Driver 为了保证实验归属，仅接受 TP=PP=DP=1。
-默认上下文 40960、KV 容量上限 36864 tokens、chunk size 4096、并发 1、Graph 关闭、overlap 保留。
+无配置名时默认上下文 40960、KV 容量上限 36864 tokens、chunk size 4096、并发 1、Graph 关闭、overlap 保留。
+`qwen3-8b-4k` 则使用 4096 总上下文和 8192 KV 槽位，应使用 P=2K 的小点验收，不能照搬本页旧模式的 8K/32K 命令。
 其他模型需自行设置正确上下文长度，dtype 必须由模型及所用后端支持。
 
 ## GPU 计时和 Profiler
@@ -268,6 +270,7 @@ Median 和 P95 仅对有效样本计算；P95 使用排序后线性插值。少�
 每次运行保存到 `results/<RUN_ID>/`：
 
 - `launch.json`、可选 `sglang.patch`、`gpu.txt`、`server.log`：保存在启动目录；用 `--server-artifacts` 可关联其客户端副本。native 无镜像 ID，未识别 Git checkout 时无源码提交号。
+- 命名模式额外保存 `profile.yaml`、`server-config.yaml`、`profile-resolution.json`，记录原文、环境覆盖及 CLI；`launch.json` 保存配置名和哈希。
 - `config.json`：Driver 参数、状态、实际 `/server_info`、模型信息、客户端依赖版本、tokenizer 哈希。
 - `inputs.json`：固定文本、精确 prefix / suffix / 预热 suffix IDs 和测量输入哈希。
 - `responses.jsonl`：控制操作、预热和测量的原始响应，阶段分别标记。

@@ -10,7 +10,7 @@
 | `serve.sh` | 统一 SGLang 参数，在当前 Python 环境启动服务 | 已有环境的服务器或云容器内部 |
 | `run_experiment.py` | 通过 HTTP 构造缓存状态、测量、校验、统计和绘图 | 任意能连接服务的客户端 |
 
-`launch_metadata.py` 是两个启动入口共用的内部记录工具。
+服务参数可保存为 `configs/serve/<名称>.yaml`；`serve_config.py` 和 `launch_metadata.py` 是共用的内部解析/记录工具。
 [部署与 Vast.ai 迁移](docs/deployment.md) · [实验用法与指标](docs/usage.md) · [逐轮实验记录](docs/experiments/README.md)
 
 ## 1. 启动服务：二选一
@@ -18,24 +18,36 @@
 先准备完整模型目录。L2 和 GPU 计时需要带本地实验补丁的 SGLang；官方镜像本身不包含该补丁。
 使用当前仓库的相邻 `../sglang` 时会自动加载该源码，也可显式设置 `SGLANG_DIR`。
 
-已有 SGLang 环境（包括用 SGLang 镜像创建的 Vast 普通容器）：
+每台机器先设置模型根目录，命名配置只需要轻量 YAML 依赖：
 
 ```bash
-MODEL_DIR=/path/to/Qwen3-8B SGLANG_DIR=/path/to/sglang \
-  HICACHE=1 FORWARD_TIMING=1 RUN_ID=server-demo \
-  bash serve.sh
+python3 -m pip install -r requirements-launch.txt
+export MODEL_ROOT=/workspace/models
+bash serve.sh --list-configs
 ```
 
-在宿主机上用 Docker 提供环境（镜像须提前下载）：
+已有环境（包括 Vast 普通容器）直接启动；需要 Docker 时使用另一个入口，二选一：
 
 ```bash
-MODEL_DIR=/path/to/Qwen3-8B SGLANG_DIR=/path/to/sglang GPU=0 \
-  HICACHE=1 FORWARD_TIMING=1 RUN_ID=server-demo \
-  CONTAINER_NAME=hicache-demo bash launch_server.sh
+# 当前环境，模型目录自动解析为 $MODEL_ROOT/Qwen3-8B。
+RUN_ID=server-demo bash serve.sh qwen3-8b-4k
+
+# Docker：镜像须提前下载，宿主机需有 NVIDIA runtime。
+GPU=0 RUN_ID=server-demo CONTAINER_NAME=hicache-demo \
+  bash launch_server.sh qwen3-8b-4k
 ```
 
-两种方式默认监听 `127.0.0.1:39081`，使用相同的 BF16、TP=1、chunk=4096、page size=1、Graph 关闭、overlap 开启配置。
+该配置开启 HiCache 和 GPU 计时，使用 BF16、TP=1、总上下文 4096、KV 池 8192、CPU 池 8 GB。
+两种方式均监听 `127.0.0.1:39081`，chunk=4096、page size=1、Graph 关闭、overlap 开启。
 启动记录保存在 `results/server-demo/`。长期运行可放在 `tmux` 中；Docker 入口退出时清理其创建的容器。
+
+```bash
+# 临时覆盖：命令行 > 显式环境变量 > 配置文件。
+bash serve.sh qwen3-8b-4k --mem-fraction-static 0.85
+bash serve.sh qwen3-8b-4k --dry-run
+```
+
+完整规则与新增配置示例见 [命名服务配置](docs/deployment.md#命名服务配置)。不带配置名的旧环境变量调用继续支持。
 
 ## 2. 客户端执行实验
 
@@ -48,7 +60,7 @@ python3 run_experiment.py run \
   --base-url http://127.0.0.1:39081 \
   --tokenizer /path/to/Qwen3-8B-tokenizer \
   --output-dir results/samples-demo \
-  --prefix-lengths 8k --suffix-lengths 128 \
+  --prefix-lengths 2k --suffix-lengths 128 \
   --groups cold l1 l2 --output-length 1 --repeats 3 --gpu-timing
 ```
 
@@ -59,10 +71,11 @@ docker exec --user "$(id -u):$(id -g)" hicache-demo \
   python /experiment/run_experiment.py run \
   --base-url http://127.0.0.1:39081 --tokenizer /model \
   --output-dir /results/samples-demo \
-  --prefix-lengths 8k --suffix-lengths 128 \
+  --prefix-lengths 2k --suffix-lengths 128 \
   --groups cold l1 l2 --repeats 3 --gpu-timing
 ```
 
+这里用 P=2K 验收：配置名中的 4K 是总上下文，必须容纳 P、S 和输出。
 多项 P/S 自动组成矩阵；每个组合先预热，再收集指定数量的有效样本，每次重新准备缓存。
 仅测 L1 时设置 `--groups l1`。服务应专供本轮实验，单请求、并发 1。
 远程机器通过 [SSH 隧道](docs/deployment.md#远程客户端) 使用相同 Driver；当前缓存控制接口只接受服务端 loopback 连接。
@@ -71,11 +84,11 @@ docker exec --user "$(id -u):$(id -g)" hicache-demo \
 
 | 配置 | 位置 | 含义 |
 |---|---|---|
-| `MODEL_DIR`、`SGLANG_DIR` | 两个启动入口 | 模型目录、源码 checkout；`SGLANG_DIR=''` 使用安装包 |
+| `MODEL_ROOT`、`MODEL_DIR`、`SGLANG_DIR` | 两个启动入口 | 模型根目录、完整模型目录覆盖、源码 checkout；`SGLANG_DIR=''` 使用安装包 |
 | `GPU` | 启动入口 | Docker 选择物理卡；直接启动设置可见卡，省略则继承环境 |
 | `DTYPE`、`KV_DTYPE`、`TP` | `serve.sh` | 权重/KV 精度与 TP；当前 Driver 仅支持 TP=PP=DP=1 |
-| `CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION` | `serve.sh` | 默认 40960、36864、0.7 |
-| `HICACHE`、`HICACHE_SIZE`、`FORWARD_TIMING` | `serve.sh` | 默认 0、8 GB（十进制）、0；GPU 计时需开启 HiCache |
+| `CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION` | 启动环境，可覆盖配置 | 无配置名时默认 40960、36864、0.7 |
+| `HICACHE`、`HICACHE_SIZE`、`FORWARD_TIMING` | 启动环境，可覆盖配置 | 无配置名时默认 0、8 GB（十进制）、0；GPU 计时需开启 HiCache |
 | `--base-url`、`--tokenizer`、`--output-dir` | Driver | 服务地址、客户端 tokenizer、客户端结果目录 |
 | `--server-artifacts` | Driver，可选 | 客户端可读的启动记录目录或其副本，不要求共享磁盘 |
 | `--profile --server-profile-dir /path` | Driver，诊断用 | 在服务端指定路径写 trace；正式扫描关闭 Profiler |
