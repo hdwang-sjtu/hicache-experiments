@@ -1,194 +1,93 @@
 #!/usr/bin/env bash
-# 在宿主机运行本脚本：创建容器 → 启动 SGLang → 持续显示服务日志。
-# 保持此终端打开，在另一个终端执行测试命令；按 Ctrl-C 停止本次容器。
+# 宿主机入口：准备 Docker 环境并调用 serve.sh，不重复定义 SGLang 参数。
 set -euo pipefail
-
-# 1. 实验参数：使用环境变量覆盖默认值，例如 GPU=2 RUN_ID=test-01 bash ...。
-#    宿主机路径在这里配置；容器中的路径固定为 /model、/experiment、/results。
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SGLANG_DIR="${SGLANG_DIR:-$SCRIPT_DIR/../sglang}"
-MODEL_DIR="${MODEL_DIR:-/state/partition/hdwang/models/Qwen3-8B}"
-RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
-RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-CONTAINER_NAME="${CONTAINER_NAME:-hicache-exp-$(id -u)-$RUN_ID}"
-IMAGE="${IMAGE:-lmsysorg/sglang:latest}"
-GPU="${GPU:-1}"
-PORT="${PORT:-39081}"
-HICACHE="${HICACHE:-0}"
-FORWARD_TIMING="${FORWARD_TIMING:-0}"
-
-# --help 和 --dry-run 都不会启动容器，适合先检查用法与最终命令。
 if [[ ${1:-} == --help ]]; then
-    cat <<'EOF'
-用法：[环境变量=值 ...] bash launch_server.sh [--dry-run] [SGLang 参数 ...]
-默认：Qwen3-8B、GPU 1、TP=1、BF16 权重和 KV、关闭 HiCache 和 CUDA Graph。
-
-常用环境变量：
-  MODEL_DIR / SGLANG_DIR   宿主机上的模型目录 / SGLang 源码目录
-  GPU / PORT              使用的宿主机 GPU 编号 / HTTP 端口
-  RUN_ID / CONTAINER_NAME  本次结果目录名 / 容器名
-  IMAGE / RESULTS_DIR     本地镜像 / 宿主机结果根目录
-  TP / DTYPE / KV_DTYPE    TP 大小 / 权重精度 / KV 精度
-  CONTEXT_LENGTH          最大上下文长度
-  MAX_TOTAL_TOKENS        GPU KV 池的 token 容量上限
-  MEM_FRACTION            SGLang 的静态显存预算比例
-  HICACHE / HICACHE_SIZE   设为 1 开启 L2 实验 / CPU KV 池大小（默认 8 GB，十进制）
-  FORWARD_TIMING          设为 1 启用原生 CUDA Event forward 指标（默认关闭）
-
-示例：
-  bash launch_server.sh --dry-run
-  GPU=1 RUN_ID=baseline-8k bash launch_server.sh
-  GPU=1 HICACHE=1 RUN_ID=l2-8k bash launch_server.sh
-  MODEL_DIR=/path/to/model DTYPE=float16 bash launch_server.sh
-
-额外参数会追加到 SGLang 启动命令；镜像和模型需提前在本机准备好。
-EOF
+    cat <<'HELP'
+用法：MODEL_DIR=/path/to/model [环境变量=值 ...] bash launch_server.sh [--dry-run] [SGLang 参数 ...]
+需要宿主机 Docker + NVIDIA runtime、本地已有镜像和模型。
+已有 SGLang 环境（包括 Vast 普通容器）请直接用 bash serve.sh。
+  MODEL_DIR / SGLANG_DIR    宿主机模型 / 源码目录；显式 SGLANG_DIR='' 使用镜像安装包
+  IMAGE                    默认 lmsysorg/sglang:latest，启动前固定为本地镜像 ID
+  GPU                      宿主机 GPU 编号或 UUID，默认 0
+  RESULTS_DIR / RUN_ID      宿主机结果根目录 / 本轮启动目录名
+  CONTAINER_NAME           本次容器名
+HICACHE、FORWARD_TIMING、PORT、DTYPE 等原样传给 serve.sh；详见 bash serve.sh --help。
+源码、模型和脚本只读挂载；结果可写。默认监听 127.0.0.1:39081。
+Ctrl-C 只停止并删除本脚本创建的容器。--dry-run 不访问 Docker 或 GPU。
+HELP
     exit 0
 fi
 dry_run=false
-if [[ ${1:-} == --dry-run ]]; then
-    dry_run=true
-    shift
-fi
+if [[ ${1:-} == --dry-run ]]; then dry_run=true; shift; fi
 [[ ${1:-} != -- ]] || shift
-[[ "$HICACHE" == 0 || "$HICACHE" == 1 ]] || {
-    echo 'HICACHE must be 0 or 1.' >&2
-    exit 2
-}
-[[ "$FORWARD_TIMING" == 0 || "$FORWARD_TIMING" == 1 ]] || exit 2
-if [[ "$FORWARD_TIMING" == 1 && "$HICACHE" != 1 ]]; then
-    echo 'FORWARD_TIMING=1 需要 HICACHE=1，以便 Driver 在指标快照前确认空闲。' >&2
-    exit 2
-fi
-
-# RUN_ID 只允许单层目录名，避免结果被写到预期目录之外。
+MODEL_DIR="${MODEL_DIR:?请设置 MODEL_DIR 为宿主机模型目录}"
+IMAGE="${IMAGE:-lmsysorg/sglang:latest}"
+GPU="${GPU:-0}"
+RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+CONTAINER_NAME="${CONTAINER_NAME:-hicache-exp-$(id -u)-$RUN_ID}"
 [[ "$RUN_ID" =~ ^[a-zA-Z0-9_.-]+$ && "$RUN_ID" != . && "$RUN_ID" != .. ]] || {
-    echo 'RUN_ID must be a single directory name.' >&2
-    exit 2
+    echo 'RUN_ID 必须是单层目录名。' >&2; exit 2;
 }
-[[ -f "$MODEL_DIR/config.json" && -d "$SGLANG_DIR/python/sglang" ]] || {
-    echo 'Check MODEL_DIR (local model) and SGLANG_DIR (source checkout).' >&2
-    exit 2
-}
-SGLANG_DIR="$(cd "$SGLANG_DIR" && pwd)"
-MODEL_DIR="$(cd "$MODEL_DIR" && pwd)"
-[[ "$RESULTS_DIR" == /* ]] || RESULTS_DIR="$PWD/$RESULTS_DIR"
-
-# 2. 组装命令。使用 Bash 数组，确保路径含空格时仍是一个完整参数。
-#    单卡、单请求，保留 overlap 和 chunked prefill；三组使用同一服务配置。
-#    --enable-metrics 用于返回现有服务端时间，两个 Graph 开关保持配置一致。
-server_args=(python -m sglang.launch_server
-    --model-path /model --host 127.0.0.1 --port "$PORT"
-    --tp-size "${TP:-1}" --dtype "${DTYPE:-bfloat16}"
-    --kv-cache-dtype "${KV_DTYPE:-bfloat16}"
-    --context-length "${CONTEXT_LENGTH:-40960}"
-    --max-total-tokens "${MAX_TOTAL_TOKENS:-36864}"
-    --mem-fraction-static "${MEM_FRACTION:-0.7}"
-    --max-running-requests 1 --chunked-prefill-size 4096 --page-size 1
-    --enable-metrics --return-output-ids
-    --cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled
-)
-experiment_groups=(cold l1)
-if [[ "$HICACHE" == 1 ]]; then
-    # 三组都在同一个开启 HiCache 的服务上运行，避免比较不同服务配置。
-    server_args+=(
-        --enable-hierarchical-cache --enable-hicache-experiment
-        --hicache-host-memory-mode cache --hicache-write-policy write_through
-        --hicache-size "${HICACHE_SIZE:-8}"
-        --hicache-io-backend kernel --hicache-mem-layout page_first
-    )
-    experiment_groups+=(l2)
+if [[ ! -v SGLANG_DIR ]]; then
+    SGLANG_DIR=""
+    [[ ! -d "$SCRIPT_DIR/../sglang/python/sglang" ]] || SGLANG_DIR="$SCRIPT_DIR/../sglang"
 fi
-server_args+=("$@")
-
-# 源码、权重和实验脚本只读挂载；只有 /results 可写。
-# PYTHONPATH 确保服务使用当前 checkout 的源码，而不是镜像自带的源码。
-# --network=host 使宿主机和容器都能通过 127.0.0.1:PORT 访问服务。
-docker_args=(docker run --detach --rm --name "$CONTAINER_NAME" --pull never
-    --gpus "device=$GPU" "--ipc=host" "--network=host"
-    --mount "type=bind,src=$SGLANG_DIR,dst=/sgl-workspace/sglang,readonly"
+[[ "$MODEL_DIR" == /* ]] || MODEL_DIR="$PWD/$MODEL_DIR"
+[[ "$RESULTS_DIR" == /* ]] || RESULTS_DIR="$PWD/$RESULTS_DIR"
+if [[ -n "$SGLANG_DIR" && "$SGLANG_DIR" != /* ]]; then SGLANG_DIR="$PWD/$SGLANG_DIR"; fi
+# host 网络保留 loopback 控制接口语义；远程客户端通过 SSH 隧道访问。
+# 不把物理 GPU 编号再次传为容器 CUDA_VISIBLE_DEVICES，避免二次编号选择。
+docker_args=(docker run --detach --name "$CONTAINER_NAME" --pull never
+    --gpus "device=$GPU" --ipc=host --network=host
     --mount "type=bind,src=$MODEL_DIR,dst=/model,readonly"
     --mount "type=bind,src=$SCRIPT_DIR,dst=/experiment,readonly"
     --mount "type=bind,src=$RESULTS_DIR,dst=/results"
-    --workdir /sgl-workspace/sglang
-    --env "PYTHONPATH=/sgl-workspace/sglang/python"
-    --env "SGLANG_SOURCE_DIR=/sgl-workspace/sglang"
-    --env "EXPERIMENT_LAUNCH_DIR=/results/$RUN_ID"
-    --env "SGLANG_ENABLE_METRICS_DEVICE_TIMER=$FORWARD_TIMING"
-    --env "HF_HUB_OFFLINE=1" --env "TRANSFORMERS_OFFLINE=1" --entrypoint /usr/bin/env
+    --workdir /experiment --entrypoint /usr/bin/env
+    --env MODEL_DIR=/model --env "EXPERIMENT_LAUNCH_DIR=/results/$RUN_ID"
+    --env MPLCONFIGDIR=/tmp/matplotlib
 )
-if [[ "$HICACHE" == 1 ]]; then
-    # 首版定向逐出只支持 Python TreeCore，显式固定以免工具链变化切换后端。
-    docker_args+=(--env "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python")
+if [[ -n "$SGLANG_DIR" ]]; then
+    docker_args+=(--mount "type=bind,src=$SGLANG_DIR,dst=/sgl-workspace/sglang,readonly"
+        --env SGLANG_DIR=/sgl-workspace/sglang)
+else
+    docker_args+=(--env SGLANG_DIR=)
 fi
-driver_timing_args=()
-if [[ "$FORWARD_TIMING" == 1 ]]; then
-    driver_timing_args+=(--gpu-timing)
-fi
-
+# 只传用户设置的参数；默认值统一由 serve.sh 决定。
+for key in HOST PORT TP DTYPE KV_DTYPE CONTEXT_LENGTH MAX_TOTAL_TOKENS MEM_FRACTION \
+    HICACHE HICACHE_SIZE FORWARD_TIMING HF_HUB_OFFLINE TRANSFORMERS_OFFLINE; do
+    [[ ! -v "$key" ]] || docker_args+=(--env "$key=${!key}")
+done
+command=(bash /experiment/serve.sh --exec "$@")
 if "$dry_run"; then
-    printf '%q ' "${docker_args[@]}" "$IMAGE" "${server_args[@]}"
+    printf '%q ' "${docker_args[@]}" "$IMAGE" "${command[@]}"
     printf '\n'
-    echo '仅打印命令。实际启动时会将本地镜像标签解析为不可变的镜像 ID。'
     exit 0
 fi
-
-# 3. 保存复现信息。先固定镜像 ID，避免 latest 标签变化影响本次启动。
+[[ -f "$MODEL_DIR/config.json" ]] || { echo 'MODEL_DIR 中没有 config.json。' >&2; exit 2; }
+if [[ -n "$SGLANG_DIR" && ! -d "$SGLANG_DIR/python/sglang" ]]; then
+    echo 'SGLANG_DIR 中没有 python/sglang。' >&2; exit 2
+fi
 image_id="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
 mkdir -p "$RESULTS_DIR"
 run_dir="$RESULTS_DIR/$RUN_ID"
-mkdir "$run_dir" # 目录已存在就报错，保护之前的实验记录。
-
-# 下面这段 Python 仅保存 JSON 和 Git 补丁，不负责启动或测试模型。
-python3 - "$run_dir" "$SGLANG_DIR" "$MODEL_DIR" "$image_id" "$GPU" \
-    "${docker_args[@]}" "$image_id" "${server_args[@]}" <<'PY'
-import json
-import pathlib
-import subprocess
-import sys
-
-out, source, model, image, gpu = sys.argv[1:6]
-
-
-def git(*args):
-    """只读取这份 SGLang checkout 的版本和改动，不修改 Git 全局设置。"""
-    return subprocess.check_output(
-        ['git', '-c', f'safe.directory={source}', '-C', source, *args],
-        text=True,
-    )
-
-
-p = pathlib.Path(out)
-(p / 'launch.json').write_text(json.dumps(dict(
-    sglang_source=source, model_directory=model, image_id=image, gpu=gpu,
-    sglang_commit=git('rev-parse', 'HEAD').strip(),
-    sglang_status=git('status', '--porcelain'), command=sys.argv[6:],
-), indent=2) + '\n')
-(p / 'sglang.patch').write_text(git('diff', '--binary', 'HEAD'))
-# 未跟踪的 Python 源码不会出现在 git diff 中，需先跟踪再运行实验。
-untracked = git('ls-files', '--others', '--exclude-standard').splitlines()
-if any(name.startswith('python/') and name.endswith('.py') for name in untracked):
-    raise SystemExit('Untracked SGLang Python sources exist; track them before benchmarking.')
-PY
-# GPU 信息获取失败时仍保留报错文本；真正的 GPU 可用性由服务启动验证。
-nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,memory.used \
-    --format=csv > "$run_dir/gpu.txt" 2>&1 || true
-
-# 4. 创建容器并接管其生命周期。只按本次返回的 ID 清理，不操作其他容器。
-container_id="$("${docker_args[@]}" "$image_id" "${server_args[@]}")"
+mkdir "$run_dir"
+# 在宿主机写记录，保留 NFS root-squash 下的普通用户写入能力。
+python3 "$SCRIPT_DIR/launch_metadata.py" --directory "$run_dir" --runtime docker \
+    --model-dir "$MODEL_DIR" --source-dir "$SGLANG_DIR" --gpu "$GPU" \
+    --image-id "$image_id" --image-ref "$IMAGE" -- "${docker_args[@]}" "$image_id" "${command[@]}"
+container_id="$("${docker_args[@]}" "$image_id" "${command[@]}")"
 cleanup() {
     docker stop --time 15 "$container_id" >/dev/null 2>&1 || true
+    docker rm "$container_id" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-echo "服务日志：$run_dir/server.log"
-echo '在另一个宿主机终端执行以下命令，运行 8K 小规模验证：'
-# 使用宿主机 UID/GID 运行 Driver，使结果文件属于当前用户；也适用于 NFS。
-printf '%q ' docker exec --user "$(id -u):$(id -g)" "$CONTAINER_NAME" \
-    python /experiment/run_experiment.py run --base-url "http://127.0.0.1:$PORT" \
-    --tokenizer /model --output-dir "/results/$RUN_ID" \
-    --prefix-lengths 8k --suffix-lengths 128 --groups "${experiment_groups[@]}" --repeats 3 "${driver_timing_args[@]}"
-printf '\n'
-# 同时在终端显示日志、在宿主机保存日志；Ctrl-C 会触发上面的清理函数。
+echo "启动记录：$run_dir；容器：$CONTAINER_NAME"
+echo "客户端连接 http://127.0.0.1:${PORT:-39081}，或在容器内执行 python /experiment/run_experiment.py run ..."
 docker logs --follow "$container_id" 2>&1 | tee "$run_dir/server.log"
+# 删除前取得服务退出码，防止启动崩溃却被报告为成功。
+server_status="$(docker wait "$container_id")"
+exit "$server_status"

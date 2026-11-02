@@ -1,13 +1,15 @@
 # 运行与指标参考
 
-[返回工程入口](../README.md) · [逐轮实验记录](experiments/README.md)
+[返回工程入口](../README.md) · [部署与远程客户端](deployment.md) · [逐轮实验记录](experiments/README.md)
 
 这里记录可复用的操作和定义；具体参数组合、实际结果与故障经过放在逐轮记录中。
 
-## 怎么读这两个脚本
+## 怎么读这些入口
 
-`launch_server.sh` 从上到下分为四步，代码中已用中文标出：读取参数 → 组装服务与 Docker 命令 → 保存复现信息 → 启动容器并跟踪日志。
-配置模型、GPU、精度或显存预算时，先看开头的环境变量和 `server_args`；修改挂载时看 `docker_args`。
+`serve.sh` 定义唯一一份服务参数：读取配置 → 组装 SGLang 命令 → 保存启动记录 → exec 服务进程。
+`launch_server.sh` 负责 Docker 镜像、挂载和生命周期，在容器内调用 `serve.sh`。
+配置模型、精度或显存预算时看 `serve.sh` 的 `server_args`；修改挂载时看 `launch_server.sh` 的 `docker_args`。
+两者通过内部工具 `launch_metadata.py` 保存记录。已有 Python 环境直接用 `serve.sh`，不需要 Docker。
 
 `run_experiment.py` 可以按下面的调用顺序阅读：
 
@@ -27,7 +29,7 @@ main()                       解析 run / analyze / self-test 子命令
 `measure` 才是计入 CSV 的 P+S 请求，且其清空和准备耗时不计入客户端测量延迟。
 
 函数说明、关键流程和命令行帮助使用中文。变量、CSV 字段和图表标签保留英文；内置测试语料也保持原文，以免修改注释时改变输入。
-可用 `bash launch_server.sh --help` 和 `python3 run_experiment.py run --help` 查看中文参数说明。
+可用 `bash serve.sh --help`、`bash launch_server.sh --help` 和 `python3 run_experiment.py run --help` 查看中文参数说明。
 
 ## L2：先在 8K 上验收
 
@@ -35,7 +37,8 @@ main()                       解析 run / analyze / self-test 子命令
 选择一张空闲且 CUDA 正常的 GPU 后，在终端 A 运行：
 
 ```bash
-cd /home/hdwang/Workspace/sglang_prj/hicache-experiments
+cd /path/to/hicache-experiments
+export MODEL_DIR=/path/to/Qwen3-8B
 GPU=3 HICACHE=1 RUN_ID=l2-demo CONTAINER_NAME=hicache-l2 bash launch_server.sh
 ```
 
@@ -108,7 +111,7 @@ GPU=1 MODEL_DIR=/path/to/local/model DTYPE=bfloat16 KV_DTYPE=bfloat16 \
 重新启动专用服务，三组都启用相同的计时设置：
 
 ```bash
-GPU=1 HICACHE=1 FORWARD_TIMING=1 RUN_ID=timing-demo \
+MODEL_DIR=/path/to/Qwen3-8B GPU=1 HICACHE=1 FORWARD_TIMING=1 RUN_ID=timing-demo \
   CONTAINER_NAME=hicache-timing bash launch_server.sh
 ```
 
@@ -119,7 +122,11 @@ docker exec --user "$(id -u):$(id -g)" hicache-timing \
   python /experiment/run_experiment.py run \
   --tokenizer /model --output-dir /results/profile-demo \
   --prefix-lengths 32k --suffix-lengths 128 --output-length 1 \
-  --groups cold l1 l2 --repeats 1 --gpu-timing --profile --no-plot
+  --groups cold l1 l2 --repeats 1 --gpu-timing --profile \
+  --server-profile-dir /tmp/hicache-profile-demo --no-plot
+
+# 将服务端本机磁盘的 trace 归档到本轮结果，再进行分析。
+docker cp hicache-timing:/tmp/hicache-profile-demo results/profile-demo/traces
 
 docker exec --user "$(id -u):$(id -g)" hicache-timing \
   python /experiment/run_experiment.py analyze-traces /results/profile-demo
@@ -127,7 +134,9 @@ docker exec --user "$(id -u):$(id -g)" hicache-timing \
 
 `--profile` 只开启测量请求期间的原生 `/start_profile` / `/stop_profile`，预热、备份和 demote 在区间外。
 它有额外开销，诊断样本只用于解释时间线，不能混入关闭 Profiler 的性能结果。
-Driver 预先创建可写的专用 `traces/` 子目录，适配服务进程和 Driver UID 不同的 NFS 环境。
+`--server-profile-dir` 是服务端绝对路径，服务端需有写入权限，Driver 不创建或修改该远程目录。
+NFS root-squash 等情况下应事先为服务用户准备可写目录；可先在服务端本机磁盘采集，结束后再复制。
+远程运行时，将服务端 trace 复制到客户端本轮目录的 `traces/`，再执行 `analyze-traces`。
 为避免 trace 与样本归属歧义，`analyze-traces` 要求每个 P/S/组恰好一次有效诊断测量。
 
 输出 `profile_summary.csv/json` 和 `profile_timeline.png`：
@@ -157,6 +166,7 @@ docker exec --user "$(id -u):$(id -g)" hicache-timing \
 ## 环境监控
 
 为区分缓存正确与环境可观测，Driver 提供可选 `--telemetry-dir`。
+该功能要求 Driver 与采样进程位于同一主机、共用单调时钟；SSH 隧道连接不代表同一主机。
 先按下文准备采样目录和 `owner.json`，再在宿主机的两个终端分别启动采样（`TELEMETRY_DIR` 替换为实际宿主机路径）：
 
 ```bash
@@ -191,7 +201,8 @@ GPU 采样使用 NVML，记录四卡的计算进程、利用率、显存、SM/�
 ```
 
 GPU 采样需要宿主机的 `pynvml`，主机采样需要 `psutil`。监控目录必须先存在且可写。
-随后运行 Driver 时添加 `--telemetry-dir /results/<采样目录>`；该路径需通过结果目录挂载在容器内可见。
+随后运行 Driver 时添加 `--telemetry-dir /results/<采样目录> --telemetry-same-host`；路径需在客户端可读。
+云容器中的 NVML PID、进程命名空间与可见主机范围需要现场核对，不能把缺失可观测性当成无干扰。
 两个监控应在正式请求前启动，使用目录中的 `stop` 文件结束采样；目录和 PID 清单每次新建。
 Driver 本身不负责后台作业编排。长期运行时应固定源码，在请求之间归档本机结果，并用独立进程管理服务和检查点；逐轮协调器源码保存在相应结果的 `audit/`。
 
@@ -256,12 +267,12 @@ Median 和 P95 仅对有效样本计算；P95 使用排序后线性插值。少�
 
 每次运行保存到 `results/<RUN_ID>/`：
 
-- `launch.json`、`sglang.patch`、`gpu.txt`、`server.log`：启动参数、镜像 ID、源码版本和服务证据。
-- `config.json`：Driver 参数、状态、实际 `/server_info`、模型信息、依赖版本、tokenizer 哈希。
+- `launch.json`、可选 `sglang.patch`、`gpu.txt`、`server.log`：保存在启动目录；用 `--server-artifacts` 可关联其客户端副本。native 无镜像 ID，未识别 Git checkout 时无源码提交号。
+- `config.json`：Driver 参数、状态、实际 `/server_info`、模型信息、客户端依赖版本、tokenizer 哈希。
 - `inputs.json`：固定文本、精确 prefix / suffix / 预热 suffix IDs 和测量输入哈希。
 - `responses.jsonl`：控制操作、预热和测量的原始响应，阶段分别标记。
 - `samples.csv`：每个测量样本及有效性；`summary.csv`：有效样本 Median / P95 和无效计数。
-- `latency.png`：服务端首 token 延迟图（需要 matplotlib）；`source/` 保存两个脚本的运行版本。
+- `latency.png`：服务端首 token 延迟图（需要 matplotlib）；`source/` 保存 Driver 运行版本；`launch-source/` 保存可选的服务启动脚本快照。
 
 目录不得复用。失败尝试保留原始数据并标明状态，不计为已完成实验。
 一个服务可对应多个测量目录，后续目录关联原始启动信息；没有启动证据时无法证明镜像和源码版本。

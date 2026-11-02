@@ -1,0 +1,4 @@
+# 纯客户端依赖；不安装 SGLang、PyTorch 或 CUDA。
+# 实际版本会记录在 config.json；仅 analyze --no-plot / self-test 时无需安装。
+transformers
+matplotlib

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Cold/L1/L2 缓存实验：构造精确输入、发送请求、验证命中并分析结果。
+"""独立 HTTP 实验客户端：构造输入、控制缓存、验证命中并分析结果。
+
+服务可由 Docker、serve.sh 或其他方式启动；本脚本不管理服务生命周期。
+模型权重和 SGLang 只需装在服务端，客户端仅需匹配的 tokenizer 文件。
 
 阅读顺序：main → run → run_samples → execute_sample → validate。
   run        运行实验：准备输入 → 等待服务 → 采样 → 保存 CSV 和汇总。
@@ -59,7 +62,7 @@ ENV_FIELDS = (
     "measurement_start_utc_ns", "measurement_end_utc_ns",
     "gpu_monitor_max_gap_ms", "host_monitor_max_gap_ms", "unexpected_gpu_pids",
 )
-# CSV 字段保持英文，方便脚本处理；含义见 README 中的“指标含义”。
+# CSV 字段保持英文，方便脚本处理；含义见 docs/usage.md 的“指标含义”。
 FIELDS = [
     "case", "group", "attempt", "request_id", "model", "dtype", "kv_dtype",
     "prefix_length", "suffix_length", "output_length", "input_sha256",
@@ -373,7 +376,10 @@ class Client:
                 ) + "\n"
             )
             self.events.flush()
-            raise RuntimeError(f"{stage} {path}: {exc} {body}") from exc
+            hint = ""
+            if isinstance(exc, urllib.error.HTTPError) and path == "/debug/hicache" and exc.code == 403:
+                hint = "；缓存控制仅接受服务端本机连接，远程实验请通过 SSH 隧道访问。"
+            raise RuntimeError(f"{stage} {path}: {exc} {body}{hint}") from exc
         elapsed = (time.perf_counter_ns() - started) / 1e6
         self.last_request_window = dict(
             measurement_start_monotonic_ns=mono_started,
@@ -1118,6 +1124,30 @@ def analyze_traces(directory, no_plot=False):
     print(f"Trace analysis: {directory / 'profile_summary.csv'}")
 
 
+def attach_server_artifacts(directory, launch_dir, config):
+    """关联客户端能读取的启动记录；远程用户可先复制记录，再显式传入目录。
+
+    不读取服务端模型路径，不尝试 SSH/SCP，不要求两个进程共享文件系统。
+    记录仅作为用户提供的来源证据，服务的实际配置仍通过 HTTP 获取。
+    """
+    if launch_dir is None:
+        config["server_artifacts"] = None
+        return
+    launch_dir = Path(launch_dir).resolve()
+    manifest = launch_dir / "launch.json"
+    if not manifest.is_file():
+        raise ValueError(f"启动记录目录中缺少 launch.json：{launch_dir}")
+    config["server_artifacts"] = str(launch_dir)
+    config["launch"] = json.loads(manifest.read_text())
+    config["server_log_path"] = str(launch_dir / "server.log")
+    if launch_dir != directory.resolve():
+        for name in ("launch.json", "sglang.patch", "gpu.txt"):
+            if (launch_dir / name).is_file():
+                shutil.copyfile(launch_dir / name, directory / name)
+        if (launch_dir / "launch-source").is_dir():
+            shutil.copytree(launch_dir / "launch-source", directory / "launch-source", dirs_exist_ok=True)
+
+
 def run(args):
     """实验总入口：组织输入、服务检查、采样和结果保存，不处理模型计算。"""
     # 延迟导入：只有真实实验需要 tokenizer，analyze 和 self-test 不依赖它。
@@ -1136,31 +1166,31 @@ def run(args):
         arguments=vars(args).copy(),
         phase="cold_l1_no_hicache",
     )
-    # 同一服务可以做多次实验；后续结果目录仍需关联最初的镜像、源码和日志。
-    launch_dir = Path(os.environ.get("EXPERIMENT_LAUNCH_DIR", str(directory)))
-    if (launch_dir / "launch.json").exists():
-        config["launch"] = json.loads((launch_dir / "launch.json").read_text())
-        config["server_log_path"] = str(launch_dir / "server.log")
-        if launch_dir.resolve() != directory.resolve():
-            shutil.copyfile(launch_dir / "launch.json", directory / "launch.json")
-            if (launch_dir / "sglang.patch").exists():
-                shutil.copyfile(launch_dir / "sglang.patch", directory / "sglang.patch")
-    else:
-        print("No launch.json found: server image/source provenance is unavailable.", file=sys.stderr)
+    # --server-artifacts 是客户端本地路径；保留旧 Docker 环境变量作为兼容默认值。
+    launch_dir = args.server_artifacts
+    if launch_dir is None:
+        candidate = Path(os.environ.get("EXPERIMENT_LAUNCH_DIR", str(directory)))
+        if (candidate / "launch.json").is_file():
+            launch_dir = candidate
     config["script_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     config["packages"] = {}
+    config["packages_scope"] = "client"
     for package in ("transformers", "torch", "sglang", "matplotlib"):
         try:
             config["packages"][package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             pass
     write_json(config_path, config)
-    # 保存实际执行的脚本，避免后来改代码后无法复现这次实验。
+    # 客户端可以只有这一个文件；启动脚本的快照由服务端自行保存。
     source = directory / "source"
     source.mkdir()
-    for name in ("run_experiment.py", "launch_server.sh"):
-        shutil.copyfile(Path(__file__).with_name(name), source / name)
+    shutil.copyfile(Path(__file__), source / "run_experiment.py")
     try:
+        attach_server_artifacts(directory, launch_dir, config)
+        if args.telemetry_dir:
+            # monotonic 时间戳不能跨主机比较，必须明确声明采样与客户端共用时钟。
+            if not args.telemetry_same_host:
+                raise ValueError("--telemetry-dir 需要 --telemetry-same-host；跨主机遥测不能用单调时钟直接关联")
         # 2. 使用本地 tokenizer 构造并保存精确输入；不下载模型或分词文件。
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
         config["tokenizer_sha256"] = {
@@ -1176,10 +1206,9 @@ def run(args):
             if args.telemetry_dir:
                 client.environment = EnvironmentMonitor(Path(args.telemetry_dir))
             if args.profile:
-                client.profile_dir = directory.resolve() / "traces"
-                client.profile_dir.mkdir()
-                # 服务进程与 Driver UID 不同；NFS root-squash 下只开放本次 trace 目录。
-                client.profile_dir.chmod(0o777)
+                # 这是服务端路径，客户端不创建、不 chmod，也不假设能直接读取它。
+                client.profile_dir = args.server_profile_dir
+                config["server_profile_dir"] = args.server_profile_dir
             # 3. 等待模型加载及服务预热结束；启动期间的 503 不算实验失败。
             deadline = time.monotonic() + args.ready_timeout
             while True:
@@ -1238,8 +1267,10 @@ def run(args):
         write_json(config_path, config)
         if (directory / "samples.csv").exists():
             analyze(directory, args.no_plot)
-        if launch_dir.resolve() != directory.resolve() and (launch_dir / "server.log").is_file():
-            shutil.copyfile(launch_dir / "server.log", directory / "server.log")
+        if launch_dir is not None:
+            launch_dir = Path(launch_dir)
+            if launch_dir.resolve() != directory.resolve() and (launch_dir / "server.log").is_file():
+                shutil.copyfile(launch_dir / "server.log", directory / "server.log")
         print(f"Results: {directory} ({config['status']})", flush=True)
 
 
@@ -1601,13 +1632,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # run：服务由 launch_server.sh 单独启动，这里只连接服务并执行实验。
+    # run：只连接指定服务，部署方式与当前客户端无关。
     p = sub.add_parser("run", help="在独占 TP=1 服务上测量 Cold/L1，或开启 HiCache 后测三组")
     p.add_argument(
         "--base-url", default="http://127.0.0.1:39081", help="SGLang HTTP 服务地址"
     )
     p.add_argument("--tokenizer", required=True, help="与服务端模型匹配的本地 tokenizer 目录")
     p.add_argument("--output-dir", required=True, help="本次结果目录，不可覆盖已有测量")
+    p.add_argument("--server-artifacts", help="可选：客户端可读的服务启动记录目录或其副本（含 launch.json）")
     p.add_argument(
         "--prefix-lengths", nargs="+", type=positive_length,
         default=[8192, 16384, 32768], help="历史 P 的 token 数，可写 8k 16k 32k",
@@ -1640,9 +1672,11 @@ def main():
     p.add_argument("--ready-timeout", type=positive_length, default=600, help="等待服务就绪的上限，单位秒")
     p.add_argument("--no-plot", action="store_true", help="保存 CSV 汇总但不绘图")
     p.add_argument("--profile", action="store_true", help="只在测量请求期间采集 CPU/GPU trace；结果含 Profiler 开销，仅用于诊断")
+    p.add_argument("--server-profile-dir", help="Profiler 写入的服务端绝对路径；启用 --profile 时必须指定")
     p.add_argument("--gpu-timing", action="store_true", help="记录原生 extend CUDA Event 区间；服务需 FORWARD_TIMING=1，区间可能包含等待")
     p.add_argument("--note", default="", help="保存在配置和图中的实验说明，例如未缩放 RoPE 外推；不影响请求内容")
     p.add_argument("--telemetry-dir", help="宿主机采样目录；启用后关联请求窗口，监控缺口或额外 GPU 进程不计入正式有效数")
+    p.add_argument("--telemetry-same-host", action="store_true", help="确认客户端与遥测进程在同一主机且共用单调时钟；远程 SSH 隧道不满足此条件")
 
     # analyze：只读取现有结果，适合调整图表或重新检查统计。
     p = sub.add_parser("analyze", help="从已保存样本重新汇总和绘图，无需服务或 GPU")
@@ -1666,6 +1700,12 @@ def main():
     elif args.command == "analyze-traces":
         analyze_traces(args.directory, args.no_plot)
     else:
+        if args.profile and (not args.server_profile_dir or not args.server_profile_dir.startswith("/")):
+            parser.error("--profile 需要 --server-profile-dir 指定服务端绝对路径")
+        if args.server_profile_dir and not args.profile:
+            parser.error("--server-profile-dir 只能与 --profile 一起使用")
+        if args.telemetry_same_host and not args.telemetry_dir:
+            parser.error("--telemetry-same-host 需要 --telemetry-dir")
         # 保留用户给出的顺序并去重，避免同一组合被无意重复测量。
         for key in ("prefix_lengths", "suffix_lengths", "groups"):
             setattr(args, key, list(dict.fromkeys(getattr(args, key))))
