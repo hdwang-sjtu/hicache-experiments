@@ -12,6 +12,22 @@
 | `run_experiment.py` | 通过 HTTP 构造缓存状态、测量、校验、统计和绘图 | 任意能连接服务的客户端 |
 
 服务参数可保存为 `configs/serve/<名称>.yaml`；`serve_config.py` 和 `launch_metadata.py` 是共用的内部解析/记录工具。
+
+```mermaid
+flowchart TD
+    all["run_all.py 总控"] -->|准备源码与模型| prepare["prepare_runtime.py"]
+    all -->|native 启动| serve["serve.sh"]
+    all -->|Docker 启动| docker["launch_server.sh"]
+    docker -->|容器内调用| serve
+    prepare -.->|提供源码与模型路径| serve
+    serve -->|exec 服务进程| server["SGLang HTTP 服务"]
+    all -->|服务就绪后启动| driver["run_experiment.py Driver"]
+    driver -->|HTTP 请求| server
+```
+
+总控分别启动服务和 Driver；Docker 模式由总控通过 `docker exec` 启动 Driver。Driver 发起 HTTP 请求并读取响应，SGLang 不启动 Driver。
+三个下层入口均可独立使用。逐文件职责、共享工具和配置关系见 [项目架构](docs/architecture.md)。
+
 [一键云任务](docs/cloud-task.md) · [分步部署](docs/deployment.md) · [实验用法与指标](docs/usage.md) · [逐轮实验记录](docs/experiments/README.md)
 
 ## 一键运行

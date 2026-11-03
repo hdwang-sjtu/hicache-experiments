@@ -1,28 +1,10 @@
 # 部署与迁移
 
-[工程入口](../README.md) · [一键云任务](cloud-task.md) · [实验用法与指标](usage.md)
+[工程入口](../README.md) · [项目架构](architecture.md) · [一键云任务](cloud-task.md) · [实验用法与指标](usage.md)
 
 ## 职责与目录
 
-```text
-hicache-experiments/
-├── run_all.py             # 总控：实例内一键运行、结果验收与清理
-├── prepare_runtime.py     # 内部工具：固定源码/模型缓存准备
-├── configs/experiments/   # 实验配置，引用服务配置和固定模型版本
-├── configs/runtime.lock.json # 镜像、SGLang 基线、补丁哈希
-├── patches/               # 随工程分发的 SGLang 实验补丁
-├── launch_server.sh       # Docker 包装：镜像、挂载、容器生命周期
-├── serve.sh               # 当前环境启动：唯一一份 SGLang 参数
-├── configs/serve/         # 按名称选择的可迁移 YAML 配置
-├── serve_config.py        # 内部工具：解析配置与显式覆盖，不导入 SGLang
-├── launch_metadata.py     # 内部工具：启动记录和源码快照
-├── run_experiment.py      # HTTP 客户端、校验、统计、绘图；可单独复制
-├── requirements-client.txt
-├── requirements-launch.txt  # 配置解析与模型下载依赖
-├── tests/                 # 不需要 GPU 的部署/客户端回归
-├── docs/experiments/      # 纳入 Git 的逐轮实验记录
-└── results/               # 忽略的原始数据与日志
-```
+文件职责、调用者及目录用途统一见 [项目架构](architecture.md)；本页保留部署步骤、配置覆盖规则和操作命令。
 
 SGLang 和模型放在工程外。默认自动使用相邻 `../sglang`；也可设置 `SGLANG_DIR=/path/to/sglang`。
 显式 `SGLANG_DIR=''` 表示使用 Python 环境/镜像已经安装的包。安装包仍需与实验接口、指标和启动参数兼容。
