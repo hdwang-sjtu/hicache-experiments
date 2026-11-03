@@ -71,7 +71,7 @@ Docker 在宿主机解析并冻结配置，容器不再次解析原始文件。`
 
 4K 配置的总上下文是 4096 tokens，包含 P、S 和输出；GPU KV 池 8192 为预热后缀分支留余量。
 首次 GPU 验收使用 `--prefix-lengths 2k --suffix-lengths 128 --groups cold l1 l2 --repeats 3 --gpu-timing`，结果目录单独新建。
-当前提供的是配置和 CPU 回归覆盖，GPU 实测结果需在可用机器上另外记录。
+该配置已通过 [本地 dev 镜像的小样本 GPU 验收](experiments/2026-11-04-dev-smoke.md)，包括容器内总控与宿主机挂载保存；迁移到其他镜像或平台仍需分别验收。
 
 ## 已有环境：直接运行
 
