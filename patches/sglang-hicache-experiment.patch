@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/arg_groups/fields/memory.py b/python/sglang/srt/arg_groups/fields/memory.py
-index c79a33346a8539639ada6c407d7a371aea7d4a2e..46f552ad14093bd3cfa761c9c6ffd00a16213327 100644
+index c79a33346a8539639ada6c407d7a371aea7d4a2e..ce0280430bae261b48f43c8555b15448103d496f 100644
 --- a/python/sglang/srt/arg_groups/fields/memory.py
 +++ b/python/sglang/srt/arg_groups/fields/memory.py
 @@ -96,6 +96,10 @@ class Memory(msgspec.Struct):
@@ -8,13 +8,13 @@ index c79a33346a8539639ada6c407d7a371aea7d4a2e..46f552ad14093bd3cfa761c9c6ffd00a
      enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
 +    enable_hicache_experiment: A[
 +        bool,
-+        "Enable local-only HiCache inspection/demotion experiments (FULL KV, TP/PP/DP=1).",
++        "Enable local-only HiCache inspection/demotion experiments (FULL or FULL+MAMBA, TP/PP/DP=1).",
 +    ] = False
      hicache_host_memory_mode: A[
          str,
          Arg(
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index 7165a5ca8c3cceea29b66862bf27f3a2a97c9fae..0b8d15918ffd24ba618cbcce9019fe5148e87c84 100644
+index 7165a5ca8c3cceea29b66862bf27f3a2a97c9fae..292b38f5b08567c28eeceb752be9cbb6b75c3036 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
 @@ -512,6 +512,7 @@ from sglang.srt.runtime_context import (
@@ -25,7 +25,7 @@ index 7165a5ca8c3cceea29b66862bf27f3a2a97c9fae..0b8d15918ffd24ba618cbcce9019fe51
      get_model,
      get_observability,
      get_parallel,
-@@ -1024,6 +1025,33 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+@@ -1024,6 +1025,35 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
      )
  
  
@@ -40,8 +40,10 @@ index 7165a5ca8c3cceea29b66862bf27f3a2a97c9fae..0b8d15918ffd24ba618cbcce9019fe51
 +    if request.client is None or request.client.host not in ("127.0.0.1", "::1"):
 +        raise HTTPException(status_code=403, detail="实验接口只接受本机请求")
 +    parallel = get_parallel()
-+    if parallel.tp_size != 1 or parallel.pp_size != 1 or parallel.dp_size != 1:
-+        raise HTTPException(status_code=400, detail="实验接口仅支持 TP=PP=DP=1")
++    if (parallel.tp_size not in (1, 2, 4) or parallel.ep_size not in (1, parallel.tp_size)
++            or parallel.pp_size != 1 or parallel.dp_size != 1
++            or parallel.moe_dp_size != 1 or parallel.enable_dp_attention):
++        raise HTTPException(status_code=400, detail="实验接口需要 TP=1/2/4、EP=1/TP、PP=DP=1")
 +    try:
 +        obj = HiCacheExperimentReqInput(**(await request.json()))
 +        if obj.action not in ("inspect", "demote") or not obj.prefix_ids:
@@ -85,7 +87,7 @@ index e32fc011409086dc7e5b03b6e80a19900fb4df41..17a578fd5873c32c1ce76c526659b4d7
      corpus_id: Optional[str] = None
      file_path: Optional[str] = None
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 79efa0bacc63b49c08540af6bcc644576e1b12a0..aa136adf57b3aa2a1db4c8dbfb13cb42dde82211 100644
+index 79efa0bacc63b49c08540af6bcc644576e1b12a0..3e50bbac02e2e4d7bae1b5c9dafa1061912e8312 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -150,6 +150,8 @@ from sglang.srt.managers.io_struct import (
@@ -97,7 +99,53 @@ index 79efa0bacc63b49c08540af6bcc644576e1b12a0..aa136adf57b3aa2a1db4c8dbfb13cb42
      InitWeightsSendGroupForRemoteInstanceReqInput,
      InitWeightsSendGroupForRemoteInstanceReqOutput,
      InitWeightsUpdateGroupReqInput,
-@@ -1749,6 +1751,7 @@ class Scheduler(
+@@ -386,6 +388,45 @@ else:
+ logger = logging.getLogger(__name__)
+ 
+ 
++def coordinate_hicache_experiment(cache, prefix_ids, action, idle, rank, gather):
++    """The injected gather is collective on every path, including local errors.
++
++    Scheduler control dispatch is serial: no request can run between preflight
++    agreement and execution. An execution error cannot roll back released slots;
++    return a fatal failure and require the experiment owner to stop the service.
++    """
++    local = dict(tp_rank=rank, ready=idle, error=None, state=None)
++    if idle:
++        try:
++            local["state"] = cache.experiment_control(
++                prefix_ids, action="preflight_demote" if action == "demote" else action)
++        except Exception as exc:
++            local["error"] = str(exc)
++    prepared = gather(local)
++    errors = [f"rank={v['tp_rank']}: {v['error']}" for v in prepared if v["error"]]
++    if errors:
++        return dict(success=False, ready=True, message="; ".join(errors),
++                    state={"ranks": {str(v["tp_rank"]): v for v in prepared}})
++    if not all(v["ready"] for v in prepared):
++        return dict(success=True, ready=False, message="等待所有 rank 空闲")
++    completed = prepared
++    if action == "demote":
++        try:
++            local["state"] = cache.experiment_control(prefix_ids, action="demote")
++        except Exception as exc:
++            local["error"] = str(exc)
++        completed = gather(local)
++        errors = [f"rank={v['tp_rank']}: {v['error']}" for v in completed if v["error"]]
++        if errors:
++            return dict(success=False, ready=True,
++                        message="部分 rank 执行失败，必须停止本次服务：" + "; ".join(errors),
++                        state={"ranks": {str(v["tp_rank"]): v for v in completed}})
++    ranks = {str(v["tp_rank"]): v["state"] for v in completed}
++    # Preserve single-rank consumers; multi-rank clients must inspect every rank.
++    state = dict(ranks["0"], ranks=ranks)
++    return dict(success=True, ready=True, state=state)
++
++
+ def _prewarm_hccl_group(device, group, device_module):
+     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+     torch.distributed.all_reduce(warmup_tensor, group=group)
+@@ -1749,6 +1790,7 @@ class Scheduler(
                  (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                  (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                  (FlushCacheReqInput, self.flush_wrapper.handle),
@@ -105,45 +153,39 @@ index 79efa0bacc63b49c08540af6bcc644576e1b12a0..aa136adf57b3aa2a1db4c8dbfb13cb42
                  (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                  (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                  (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
-@@ -5345,6 +5348,42 @@ class Scheduler(
+@@ -5345,6 +5387,36 @@ class Scheduler(
  
          return DetachHiCacheStorageReqOutput(success=False, message=msg)
  
 +    def handle_hicache_experiment(self, recv_req: HiCacheExperimentReqInput):
-+        """只协调控制请求；树结构和槽位操作由缓存自身负责。"""
++        """All ranks agree before freeing; never measure after a partial failure."""
 +        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 +
-+        if not get_memory().enable_hicache_experiment:
-+            return HiCacheExperimentReqOutput(success=False, message="实验接口未启用")
 +        parallel = get_parallel()
-+        if (
-+            parallel.tp_size != 1
-+            or parallel.pp_size != 1
-+            or parallel.dp_size != 1
-+            or not self.enable_hierarchical_cache
-+            or not isinstance(self.tree_cache, UnifiedRadixCache)
-+            or not self.spec_algorithm.is_none()
-+            or self.disaggregation_mode != DisaggregationMode.NULL
-+            or get_memory().enable_session_radix_cache
-+        ):
++        if (not get_memory().enable_hicache_experiment
++                or parallel.tp_size not in (1, 2, 4)
++                or parallel.ep_size not in (1, parallel.tp_size)
++                or parallel.pp_size != 1 or parallel.dp_size != 1
++                or parallel.moe_dp_size != 1 or parallel.enable_dp_attention
++                or not self.enable_hierarchical_cache
++                or not isinstance(self.tree_cache, UnifiedRadixCache)
++                or not self.spec_algorithm.is_none()
++                or self.disaggregation_mode != DisaggregationMode.NULL
++                or get_memory().enable_session_radix_cache):
 +            return HiCacheExperimentReqOutput(
-+                success=False,
-+                message="仅支持无推测解码/会话缓存的 FULL KV 单卡 HiCache 实验",
-+            )
-+        # 包含 overlap 结果队列和 HiCache D2H/H2D；忙时返回，由 Driver 在计时外轮询。
-+        if not self.is_fully_idle():
-+            return HiCacheExperimentReqOutput(
-+                success=True, message="等待请求与异步传输结束"
-+            )
-+        try:
-+            state = self.tree_cache.experiment_control(
-+                recv_req.prefix_ids, action=recv_req.action
-+            )
-+        except (ValueError, RuntimeError) as exc:
-+            return HiCacheExperimentReqOutput(
-+                success=False, ready=True, message=str(exc)
-+            )
-+        return HiCacheExperimentReqOutput(success=True, ready=True, state=state)
++                success=False, message="需要 TP=1/2/4、EP=1/TP、PP=DP=1，无推测/会话的 HiCache")
++
++        def gather(value):
++            if parallel.tp_size == 1:
++                return [value]
++            values = [None] * parallel.tp_size
++            torch.distributed.all_gather_object(values, value, group=self.tp_cpu_group)
++            return values
++
++        result = coordinate_hicache_experiment(
++            self.tree_cache, recv_req.prefix_ids, recv_req.action,
++            self.is_fully_idle(), parallel.tp_rank, gather)
++        return HiCacheExperimentReqOutput(**result)
 +
      def flush_cache(self, empty_cache: bool = True):
          """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
@@ -183,24 +225,26 @@ index f62afbae8ed6023cdb161649af1eb70120437731..fefde68ec5ffea23a0c26f6055b1707f
          """Clear the hierarchical cache storage."""
          self.auto_create_handle_loop()
 diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
-index d1399f088dc0c8236497fb8c956a3b5a89e9865d..4bb54914a4b5960781ce68223825c49687d78806 100644
+index d1399f088dc0c8236497fb8c956a3b5a89e9865d..6840d46bc3bbb7a1e0edf4c48ee86867118bb237 100644
 --- a/python/sglang/srt/mem_cache/unified_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
-@@ -856,6 +856,141 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -856,6 +856,176 @@ class UnifiedRadixCache(BasePrefixCache):
          self._free_values(result.device_frees, result.host_frees)
          self._accumulate_tracker(tracker, result.tracker)
  
 +    def experiment_control(self, prefix_ids: list[int], *, action: str) -> dict:
 +        """Scheduler 空闲后调用：检查目标 P，或保留 CPU 副本定向逐出 GPU。
 +
-+        首版只允许单条 FULL-KV 实验分支，避免共享分支和混合组件的隐式逐出。
++        只允许单条 FULL 或 FULL+MAMBA 分支；混合模型必须在 P 处有完整状态。
 +        除了复用正常 match 的边界拆分，所有检查都先于释放；绝不直接释放 Tensor。
 +        """
 +        cc = self.cache_controller
 +        if (
 +            self.disable
 +            or not isinstance(self.tree_core, UnifiedTreeCore)
-+            or self.tree_components != (ComponentType.FULL,)
++            or set(self.tree_components) not in (
++                {ComponentType.FULL}, {ComponentType.FULL, ComponentType.MAMBA}
++            )
 +            or self.sidecar_pool_specs
 +            or self.session.slots
 +            or self.linker is not None
@@ -210,7 +254,7 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..4bb54914a4b5960781ce68223825c496
 +            or self.enable_storage
 +        ):
 +            raise ValueError(
-+                "仅支持 Python TreeCore、无 sidecar/L3 的 FULL-KV write_through 缓存"
++                "仅支持 Python TreeCore、无 sidecar/L3 的 FULL 或 FULL+MAMBA write_through 缓存"
 +            )
 +        if (
 +            self.ongoing_write_through
@@ -218,7 +262,7 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..4bb54914a4b5960781ce68223825c496
 +            or cc.has_inflight_device_transfers()
 +        ):
 +            raise ValueError("备份或恢复尚未完成，不能读取稳定状态或逐出")
-+        if action not in ("inspect", "demote"):
++        if action not in ("inspect", "demote", "preflight_demote"):
 +            raise ValueError("未知实验操作")
 +        if not prefix_ids or len(prefix_ids) % self.page_size:
 +            raise ValueError("prefix_ids 必须非空且按 page_size 对齐")
@@ -231,12 +275,16 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..4bb54914a4b5960781ce68223825c496
 +
 +        # 显式建立零值，保证第一次 H2D 之前的 /metrics 也有可读取的基准。
 +        metrics = self.metrics_collector
++        hybrid = ComponentType.MAMBA in self.tree_components
++        mamba_pool = self.host_pool_group.get_pool(PoolName.MAMBA) if hybrid else None
 +        if metrics is not None:
 +            metrics.load_back_num_bytes.labels(**metrics.labels)
 +            metrics.load_back_num_tokens.labels(
 +                **metrics.labels, pool=PoolName.KV.value
 +            )
 +            metrics.load_back_duration_seconds.labels(**metrics.labels)
++            if hybrid:
++                metrics.load_back_num_tokens.labels(**metrics.labels, pool=PoolName.MAMBA.value)
 +
 +        def inspect():
 +            # 标准 match 会在 P 处拆分节点，并保留正常的 LRU/引用和备份信息。
@@ -275,6 +323,20 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..4bb54914a4b5960781ce68223825c496
 +                kv_bytes_per_token=int(cc.mem_pool_host.size_per_token),
 +                demoted_tokens=0,
 +            )
++            if hybrid:
++                endpoint = path[0] if path else self.tree_core.root_node
++                data = endpoint.component_data[ComponentType.MAMBA]
++                # A match at an earlier checkpoint must never masquerade as P.
++                exact = match.device_prefix_len + match.host_hit_length == len(prefix_ids)
++                state.update(
++                    cache_components=["full", "mamba"],
++                    mamba_device_states=int(data.value is not None) if exact else 0,
++                    mamba_host_states=int(data.host_value is not None) if exact else 0,
++                    mamba_state_bytes=int(mamba_pool.size_per_token),
++                    mamba_device_free=self.req_to_token_pool.mamba_allocator.available_size(),
++                    mamba_host_free=mamba_pool.available_size(),
++                )
++                state["backup_complete"] = state["backup_complete"] and exact and data.host_value is not None
 +            return state, path
 +
 +        before, path = inspect()
@@ -305,8 +367,17 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..4bb54914a4b5960781ce68223825c496
 +                raise ValueError("目标分支仍有引用或异步操作，拒绝逐出")
 +            if data.host_value is None or len(data.host_value) != len(node.key):
 +                raise ValueError("目标分支或其后缀没有完整 CPU 副本")
++            if hybrid:
++                state_data = node.component_data[ComponentType.MAMBA]
++                if state_data.lock_ref or state_data.host_lock_ref or state_data.session_ref:
++                    raise ValueError("线性注意力状态仍有引用，拒绝逐出")
++                if state_data.value is not None and state_data.host_value is None:
++                    raise ValueError("线性注意力状态没有完整 CPU 副本")
 +
-+        tracker = {ComponentType.FULL: 0}
++        if action == "preflight_demote":
++            return before
++
++        tracker = {ct: 0 for ct in self.tree_components}
 +        started = time.perf_counter()
 +        for node in order:
 +            if not node.evicted:  # 重复 demote 不重复释放槽位。
@@ -323,16 +394,22 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..4bb54914a4b5960781ce68223825c496
 +        ):
 +            raise RuntimeError("Demote 后状态校验失败，请停止该次实验并检查缓存")
 +        after["demoted_tokens"] = tracker[ComponentType.FULL]
++        if hybrid:
++            if (after["mamba_device_states"] != 0 or after["mamba_host_states"] != 1
++                    or after["mamba_host_free"] != before["mamba_host_free"]
++                    or after["mamba_device_free"] - before["mamba_device_free"] != tracker[ComponentType.MAMBA]):
++                raise RuntimeError("Demote 后线性注意力状态校验失败")
++            after["demoted_mamba_states"] = tracker[ComponentType.MAMBA]
 +        return after
 +
      def _drop_subtree_no_host(
          self, node_id: NodeId, tracker: dict[ComponentType, int]
      ) -> bool:
 diff --git a/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py b/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
-index 203dbe3ac9df5db5dd3aa518623bda95ab852be2..d306ef158a2a30b8ea609eb7bcc854589a65e793 100644
+index 203dbe3ac9df5db5dd3aa518623bda95ab852be2..c19559b9517c8bc07148b3edc863920557b1678f 100644
 --- a/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
 +++ b/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
-@@ -12035,5 +12035,129 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
+@@ -12035,5 +12035,185 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
          cache.sanity_check()
  
  
@@ -458,6 +535,62 @@ index 203dbe3ac9df5db5dd3aa518623bda95ab852be2..d306ef158a2a30b8ea609eb7bcc85458
 +        with self.assertRaisesRegex(ValueError, "额外共享分支"):
 +            cache.experiment_control(tokens[:8], action="demote")
 +        self.assertEqual(allocator.available_size(), available)
++
++
++@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
++class TestHybridHiCacheExperiment(CustomTestCase):
++    @staticmethod
++    def fixture():
++        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
++        cache, allocator, pool = build_fixture(CacheConfig(
++            kv_size=64, num_layers=2, full_attention_layer_ids=(1,),
++            components=(ComponentType.FULL, ComponentType.MAMBA),
++        ), tree_core_backend="python")
++        tokens = list(range(1, 13))
++        cache.insert(InsertParams(key=RadixKey(array("q", tokens)),
++                                  value=allocator.alloc(12), mamba_value=pool.mamba_allocator.alloc(1)))
++        node = next(iter(cache.tree_core.root_node.children.values()))
++        cache.tree_core.commit_backup(node.id, torch.arange(12, dtype=torch.int64), {
++            ComponentType.MAMBA: [PoolTransfer(name=PoolName.MAMBA, host_indices=torch.tensor([0]))]
++        })
++        host = SimpleNamespace(size=128, size_per_token=16, available_size=lambda:116)
++        mamba = SimpleNamespace(size=16, size_per_token=1024, available_size=lambda:15)
++        cache.cache_controller = SimpleNamespace(write_policy="write_through",
++            has_inflight_device_transfers=lambda:False, mem_pool_host=host)
++        cache.host_pool_group = SimpleNamespace(get_pool=lambda name:mamba)
++        cache.host_memory_mode = "cache"
++        cache.tree_core.set_hicache_enabled()
++        return cache, allocator, pool, tokens, node
++
++    def test_demote_preserves_state_and_releases_both_allocators(self):
++        cache, allocator, pool, tokens, node = self.fixture()
++        before = cache.experiment_control(tokens, action="inspect")
++        self.assertTrue(before['backup_complete'])
++        after = cache.experiment_control(tokens, action="demote")
++        self.assertEqual((after['device_tokens'],after['host_hit_tokens']), (0,12))
++        self.assertEqual((after['mamba_device_states'],after['mamba_host_states']), (0,1))
++        self.assertEqual(after['mamba_device_free']-before['mamba_device_free'], 1)
++        again=cache.experiment_control(tokens, action="demote")
++        self.assertEqual(again['demoted_mamba_states'],0)
++
++    def test_missing_or_locked_state_is_rejected_before_free(self):
++        for missing in (True,False):
++            cache, allocator, pool, tokens, node = self.fixture()
++            data=node.component_data[ComponentType.MAMBA]
++            if missing: data.host_value=None
++            else: data.lock_ref=1
++            available=allocator.available_size()
++            with self.assertRaises(ValueError): cache.experiment_control(tokens, action="demote")
++            self.assertEqual(allocator.available_size(),available)
++            self.assertIsNotNone(data.value)
++
++    def test_prefix_without_checkpoint_is_not_accepted(self):
++        cache, allocator, pool, tokens, node = self.fixture()
++        state=cache.experiment_control(tokens[:8],action="inspect")
++        self.assertFalse(state['backup_complete'])
++        available=allocator.available_size()
++        with self.assertRaises(ValueError): cache.experiment_control(tokens[:8],action="demote")
++        self.assertEqual(allocator.available_size(),available)
 +
 +
  if __name__ == "__main__":

@@ -1,8 +1,8 @@
 {
-  "image": "lmsysorg/sglang@sha256:e3a4f06001a29542fc4a8638536d9ffc5eb9c9942b08603c09b19a56eae4a1ae",
+  "image": "lmsysorg/sglang@sha256:b4323a896f349d43a267c419c0267538b06c64a73110a0d0fd87496234df5dcd",
   "sglang_repository": "https://github.com/sgl-project/sglang.git",
   "sglang_base": "baa9befa381511cd4d56f83980951e5a45fffc6d",
   "patch": "patches/sglang-hicache-experiment.patch",
-  "patch_sha256": "a39cde7c804cddb27336e4b79f4f906e9a7742ac012717d0f977693555c8f072",
-  "patch_source_commit": "02a56e2b2499bbd5c37f17103b4fed2e5121c63f"
+  "patch_sha256": "45913465ca6b28a7c01c2a3dd1a186adcc52367728c9d2d691af3fc712a20d0f",
+  "patch_source_commit": "b511bd1902325de3feb120e68a929000556f423c"
 }

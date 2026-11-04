@@ -79,13 +79,13 @@ Docker 包装只转交显式变量和追加参数，并调用 `serve.sh --exec`�
 - **服务配置**决定怎样提供推理服务：上下文、KV 容量、精度、HiCache 和计时等；它的顶层 `model` 是本地目录名，不等于模型仓库或模型版本。
 - **版本锁与补丁**决定总控准备的运行代码：`sglang_base` 是实际 checkout 的 HEAD，工作区再应用锁定哈希的补丁；`patch_source_commit` 记录补丁来源，并不是准备时检出的 HEAD。官方镜像本身不会自动包含本地实验补丁。
 
-总控将固定模型放入 `<MODEL_ROOT>/<服务配置的 model>/<revision>/`，并将准备好的源码缓存路径传给 `SGLANG_DIR`。
+显式 `--model-dir`/`MODEL_DIR` 时总控只读检查现有模型；否则总控将固定模型放入 `<MODEL_ROOT>/<服务配置的 model>/<revision>/`，并将准备好的源码缓存路径传给 `SGLANG_DIR`。
 源码缓存复用前检查基线与实际差异；模型缓存通过版本标记和文件清单检查完整性，缺失或变化时补齐/重新下载。详细规则见 [固定版本与缓存](cloud-task.md#固定版本与缓存)。
 
 版本锁由总控使用，独立启动脚本不会自动读取它或应用补丁。
 手工部署时，未设置 `SGLANG_DIR` 会优先使用存在的相邻 `../sglang`，也可显式指定 checkout；`SGLANG_DIR=''` 使用当前环境或镜像中的安装包。
 这些代码来源仍须与实验接口和指标兼容。通过 `PYTHONPATH` 接入源码只替换 Python 代码，不会安装 Torch、CUDA 或 Kernel 依赖。
-Docker 总控会使用锁定镜像并记录实际镜像 ID；native 总控保留期望镜像与实际软件环境，不能据此认定所在环境的镜像摘要已验证。
+Docker 总控默认使用锁定镜像，允许 `--image` 覆盖并记录实际镜像 ID；native 总控保留期望镜像与实际软件环境，不能据此认定所在环境的镜像摘要已验证。
 
 ## Driver 与服务的 HTTP 边界
 
@@ -127,3 +127,11 @@ Driver 不直接调用服务端 Python 对象，也不要求共享磁盘：`--to
 
 当前 CPU 回归使用模拟 HTTP 服务、Docker 和下载器，覆盖启动记录、配置覆盖、客户端请求、总控编排和失败清理；它不证明 CUDA、真实缓存搬运或 GPU 性能。
 新入口与新平台仍需在目标机器分别完成小点、容量边界及实际 GPU/平台验收，操作见 [分步部署](deployment.md) 和 [一键云任务](cloud-task.md)。
+
+## Qwen3.5 与多 rank 扩展
+
+`run_all.py` 仍是唯一总控，`run_experiment.py` 仍是 HTTP Driver。内部模块 [rank_metrics.py](../rank_metrics.py) 负责全 rank 状态校验、异步指标等待、差值与时间聚合，没有独立命令入口。新增配置分别描述 35B 小矩阵和 122B 长前缀；总控应用 TP/EP、P/S 和容量覆盖后，冻结配置供两个启动脚本共用。
+
+补丁中的 Scheduler 将控制请求广播后的本地检查结果汇聚，所有 rank 通过后才执行 GPU 驱逐，再汇聚执行结果。FULL+MAMBA 路径要求 P 边界同时存在 KV 与线性状态备份；详细过程见 [Qwen3.5 实验](qwen35.md)。
+
+`tests/test_parallel_cache.py` 检查分布式预检失败不释放、部分执行失败、缺失 rank、状态和传输计数以及容量边界。历史 L1 工作区保持独立，不作为主项目运行时依赖。

@@ -17,7 +17,7 @@ if [[ ${1:-} == --help ]]; then
                              显式 SGLANG_DIR='' 使用当前环境安装包
   PYTHON_BIN / GPU            默认 python3；GPU 可选，设置 CUDA_VISIBLE_DEVICES
   RESULTS_DIR / RUN_ID        启动记录根目录 / 单层目录名，默认项目 results / UTC 时间
-服务环境变量仍支持 HOST、PORT、TP、DTYPE、KV_DTYPE、CONTEXT_LENGTH、MAX_TOTAL_TOKENS、
+服务环境变量仍支持 HOST、PORT、TP、EP、CHUNKED_PREFILL_SIZE、DTYPE、KV_DTYPE、CONTEXT_LENGTH、MAX_TOTAL_TOKENS、
 MEM_FRACTION、HICACHE、HICACHE_SIZE、FORWARD_TIMING。
 旧模式默认上下文 40960、KV 池 36864、BF16、TP=1、显存比例 0.7、HiCache/计时关闭。
 --dry-run 不访问模型或 GPU，不写结果；命名配置解析仅需要 PyYAML。
@@ -86,10 +86,10 @@ else
     [[ "$HICACHE" == 0 ]] || runtime_env+=("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python")
     server_args=("$PYTHON_BIN" -m sglang.launch_server
         --model-path "$MODEL_DIR" --host "${HOST:-127.0.0.1}" --port "${PORT:-39081}"
-        --tp-size "${TP:-1}" --dtype "${DTYPE:-bfloat16}" --kv-cache-dtype "${KV_DTYPE:-bfloat16}"
+        --tp-size "${TP:-1}" --ep-size "${EP:-1}" --dtype "${DTYPE:-bfloat16}" --kv-cache-dtype "${KV_DTYPE:-bfloat16}"
         --context-length "${CONTEXT_LENGTH:-40960}" --max-total-tokens "${MAX_TOTAL_TOKENS:-36864}"
         --mem-fraction-static "${MEM_FRACTION:-0.7}"
-        --max-running-requests 1 --chunked-prefill-size 4096 --page-size 1
+        --max-running-requests 1 --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:-4096}" --page-size 1
         --enable-metrics --return-output-ids
         --cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled)
     if [[ "$HICACHE" == 1 ]]; then

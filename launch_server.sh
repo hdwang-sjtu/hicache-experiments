@@ -65,12 +65,17 @@ if [[ -n "$SGLANG_DIR" && "$SGLANG_DIR" != /* ]]; then SGLANG_DIR="$PWD/$SGLANG_
 # 不把物理 GPU 编号再次传为容器 CUDA_VISIBLE_DEVICES，避免二次编号选择。
 docker_args=(docker run --detach --name "$CONTAINER_NAME" --pull never
     --cidfile "$RESULTS_DIR/$RUN_ID/container.id"
-    --gpus "device=$GPU" --ipc=host --network=host
+    --user "$(id -u):$(id -g)"
+    --gpus "\"device=$GPU\"" --ipc=host --network=host
     --mount "type=bind,src=$MODEL_DIR,dst=/model,readonly"
     --mount "type=bind,src=$SCRIPT_DIR,dst=/experiment,readonly"
     --mount "type=bind,src=$RESULTS_DIR,dst=/results"
     --workdir /experiment --entrypoint /usr/bin/env
     --env MODEL_DIR=/model --env "EXPERIMENT_LAUNCH_DIR=/results/$RUN_ID"
+    --env HOME=/tmp/hicache-home --env XDG_CACHE_HOME=/tmp/hicache-cache
+    --env HF_HOME=/tmp/huggingface --env TRITON_CACHE_DIR=/tmp/triton
+    --env TORCH_EXTENSIONS_DIR=/tmp/torch-extensions --env FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer
+    --env SGLANG_CACHE_DIR=/tmp/sglang-runtime --env SGLANG_JIT_CACHE_DIR=/tmp/sglang-jit
     --env MPLCONFIGDIR=/tmp/matplotlib
 )
 if [[ -n "$SGLANG_DIR" ]]; then
@@ -85,7 +90,7 @@ if [[ -n "$profile_json" ]]; then
     for entry in "${profile_environment[@]}"; do docker_args+=(--env "$entry"); done
     command=(bash /experiment/serve.sh --exec --resolved-profile "/results/$RUN_ID/profile-resolution.json")
 else
-    for key in HOST PORT TP DTYPE KV_DTYPE CONTEXT_LENGTH MAX_TOTAL_TOKENS MEM_FRACTION \
+    for key in HOST PORT TP EP CHUNKED_PREFILL_SIZE DTYPE KV_DTYPE CONTEXT_LENGTH MAX_TOTAL_TOKENS MEM_FRACTION \
         HICACHE HICACHE_SIZE FORWARD_TIMING HF_HUB_OFFLINE TRANSFORMERS_OFFLINE; do
         [[ ! -v "$key" ]] || docker_args+=(--env "$key=${!key}")
     done

@@ -8,8 +8,8 @@
 
 SGLang 和模型放在工程外。默认自动使用相邻 `../sglang`；也可设置 `SGLANG_DIR=/path/to/sglang`。
 显式 `SGLANG_DIR=''` 表示使用 Python 环境/镜像已经安装的包。安装包仍需与实验接口、指标和启动参数兼容。
-CPU L2 定向逐出补丁在 SGLang 提交 `02a56e2b24` 中，官方上游镜像不会自动包含它。
-客户端只需 `run_experiment.py` 和 tokenizer 文件；`--tokenizer` 永远是客户端路径，`--output-dir` 永远写在客户端。
+CPU L2 及混合缓存多卡补丁由本仓库版本锁记录，官方上游镜像不会自动包含它。
+客户端需要 `run_experiment.py`、`rank_metrics.py` 和 tokenizer 文件；`--tokenizer` 永远是客户端路径，`--output-dir` 永远写在客户端。
 
 ## 命名服务配置
 
@@ -48,7 +48,7 @@ sglang:
 每个文件是一份完整配置，不提供继承/组合。新增场景时复制示例、修改内容，并使用新的文件名（调用时省略 `.yaml`）。
 
 覆盖顺序为 **命令行 > 显式环境变量 > 文件**，未设置的环境变量不会用旧脚本默认值覆盖配置。
-原有 `HOST/PORT/TP/DTYPE/KV_DTYPE/CONTEXT_LENGTH/MAX_TOTAL_TOKENS/MEM_FRACTION/HICACHE_SIZE` 映射到对应 SGLang 参数；
+原有 `HOST/PORT/TP/EP/CHUNKED_PREFILL_SIZE/DTYPE/KV_DTYPE/CONTEXT_LENGTH/MAX_TOTAL_TOKENS/MEM_FRACTION/HICACHE_SIZE` 映射到对应 SGLang 参数；
 `HICACHE` 同时控制 hierarchical-cache 和实验接口，`FORWARD_TIMING` 覆盖 GPU 计时开关。
 关闭 HiCache 时也要关闭依赖它的计时，例如 `HICACHE=0 FORWARD_TIMING=0 bash serve.sh qwen3-8b-4k`。
 SGLang 的启用标志不能写成 `--enable-hierarchical-cache false`；临时关闭使用上述环境变量，或修改 YAML 中的布尔值。
@@ -96,7 +96,7 @@ MODEL_DIR=/workspace/models/Qwen3-8B SGLANG_DIR=/workspace/sglang \
 宿主机需要 Docker、NVIDIA runtime、本地模型和本地已有镜像。可以先拉取此前使用的固定镜像：
 
 ```bash
-export IMAGE=lmsysorg/sglang@sha256:e3a4f06001a29542fc4a8638536d9ffc5eb9c9942b08603c09b19a56eae4a1ae
+export IMAGE=lmsysorg/sglang@sha256:b4323a896f349d43a267c419c0267538b06c64a73110a0d0fd87496234df5dcd
 docker pull "$IMAGE"
 MODEL_DIR=/path/to/Qwen3-8B SGLANG_DIR=/path/to/sglang GPU=0 \
   HICACHE=1 FORWARD_TIMING=1 RUN_ID=server-demo \
@@ -148,6 +148,8 @@ Qwen3-8B 客户端可复制模型的 `tokenizer.json`、`tokenizer_config.json`�
 启动记录是用户提供的来源证据，客户端不会自动验证该副本必然对应当前 URL。
 
 ## Vast.ai 普通容器
+
+Qwen3.5 35B/122B 的统一任务命令见 [Qwen3.5 实验](qwen35.md)。`run_all.py` 会准备配套源码，避免手工启动时误用相邻的旧 checkout。
 
 Vast 普通实例已经是容器，直接使用 `serve.sh`；不要在里面再次运行 `launch_server.sh`。
 自定义模板可使用 SGLang 镜像，选择 SSH 模式。镜像应固定版本，并确认宿主驱动兼容。

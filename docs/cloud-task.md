@@ -53,7 +53,7 @@ test:
 `configs/runtime.lock.json` 固定官方镜像摘要、SGLang 基线、仓库内补丁 SHA256。
 源码准备先检出指定基线，再执行 `git apply --check` 和应用补丁；同时验证实际差异哈希。
 它不修改你已有的 SGLang checkout。缓存中的源码如果被改动会报错，不会自动重置用户文件或重复打补丁。
-当前补丁来自 `02a56e2b24`，提供 CPU 备份检查、GPU 定向逐出与稳定状态检查，不修改模型计算。
+当前补丁来源由版本锁记录，提供 FULL/FULL+MAMBA 的备份检查、多 rank 协同驱逐和稳定状态检查，不修改模型计算。
 
 模型使用 Hugging Face 固定 commit 下载，缺少分片或中断下载时会补齐。
 完成后保存版本与文件清单；后续只有同仓库、同版本且文件完整的缓存才直接复用。仅有 `config.json` 不算完整模型。
@@ -69,11 +69,11 @@ test:
 ```
 
 可设置 `HICACHE_CACHE_DIR` 修改缓存根目录，`MODEL_ROOT` 单独修改版本化模型缓存根目录。
-总控不接受指向其他位置的 `MODEL_DIR`；手工模型目录仍可用原来的 `serve.sh` 和 Driver 分步运行。
-这样不会覆盖已有的同名模型，也不会将不同模型版本混在一起。
+`--model-dir` 或 `MODEL_DIR` 可只读使用现有本地模型，检查分片索引和 safetensors 头部，不做全权重哈希，也不写入完成标记。
+固定 revision 缓存和手工模型分别记录来源。`--source-repository` 可指定含固定基线的本地 Git 仓库作为离线源码来源，补丁校验仍执行。
 下载阶段与推理计时完全分开。认证由环境中的 Hugging Face 凭据提供，不写入实验 YAML 或任务状态。
 
-Docker 模式实际使用版本锁中的镜像并记录其本地镜像 ID。native 模式只记录“期望镜像”和真实软件环境，不能从容器内部假装已验证镜像摘要。
+Docker 模式默认使用版本锁中的镜像，允许 `--image` 覆盖，并记录其本地镜像 ID。native 模式只记录“期望镜像”和真实软件环境，不能从容器内部假装已验证镜像摘要。
 脚本不安装或升级 Torch/CUDA；依赖不匹配、GPU 不可用等问题会作为启动失败留下日志。
 
 ## 结果、失败与清理
@@ -81,7 +81,9 @@ Docker 模式实际使用版本锁中的镜像并记录其本地镜像 ID。nati
 ```text
 results/<run-id>/
 ├── run.json                  # 总体状态、阶段、退出码及失败原因
-├── experiment.yaml           # 本轮实验配置
+├── experiment.yaml           # 原始实验配置
+├── resolved-experiment.json  # 应用 CLI 覆盖后的实验配置
+├── gpu-memory.jsonl          # 启动至清理期间的采样显存与阶段
 ├── runtime.lock.json         # 版本锁
 ├── sglang.patch              # 本轮补丁
 ├── code/                     # 实际使用的入口/Driver/服务配置快照
@@ -98,7 +100,7 @@ results/<run-id>/
 服务提前退出会立即失败，不必等满就绪时间。测量中服务退出也会终止测试。
 
 开始前确认端口空闲，就绪后用原生 `served-model-name` 核对本任务的随机身份；不向其他服务发送清缓存或测试请求。
-完成要求 Driver 正常退出、状态 complete、必要输出文件存在，且每个 P/S/组的有效样本数与配置一致。
+完成要求 Driver 正常退出、状态 complete、必要输出文件存在，且每个 P/S/组的有效样本数与配置一致；GPU timing 任务还重新核对逐 rank 原始指标与 CSV。
 不启用 `no-plot` 时还要求相应延迟/GPU 计时图生成。
 
 成功、失败和 SIGINT/SIGTERM 都清理本任务创建的服务：native 按独立进程组，Docker 按已记录的容器 ID。
@@ -131,5 +133,7 @@ python3 -m pip install -r /workspace/hicache-experiments/requirements-launch.txt
 Vast 的 SSH/Jupyter 模式会替换原镜像 entrypoint，应将任务命令放到 On-start 配置；具体入口见 [Vast 模板设置](https://docs.vast.ai/guides/templates/template-settings)。
 结果目录应指向需要保留的磁盘或挂载卷；实例销毁前的结果取回由部署侧负责。
 
-首版不包括正式样本断点续跑、自动遥测、结果上传和云实例计费回收。重新执行使用新任务目录；源码/模型缓存可复用。
+不包括正式样本断点续跑、完整环境有效性遥测、结果上传和云实例计费回收。任务自带的显存采样用于诊断，不代替环境有效性判断。重新执行使用新任务目录；源码/模型缓存可复用。
 CPU 回归只验证流程和故障清理，真实 GPU 性能与 Vast 部署需要在目标机器上验收。
+
+Qwen3.5 的 TP/EP、P/S、分块及容量覆盖命令见 [Qwen3.5 实验](qwen35.md)。Vast On-start 中也使用同一 `run_all.py` 命令，并把 `RESULTS_DIR` 指向持久卷。

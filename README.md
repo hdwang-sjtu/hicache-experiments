@@ -30,6 +30,8 @@ flowchart TD
 
 [一键云任务](docs/cloud-task.md) · [分步部署](docs/deployment.md) · [实验用法与指标](docs/usage.md) · [逐轮实验记录](docs/experiments/README.md)
 
+Qwen3.5 混合注意力模型使用同一入口，支持 TP=1/2/4、EP=1/TP 的 Cold/L1/L2；本地模型、Docker 和 122B 长前缀用法见 [Qwen3.5 实验](docs/qwen35.md)。
+
 ## 一键运行
 
 已有 SGLang 依赖环境（例如官方镜像创建的 Vast 实例）时：
@@ -119,7 +121,7 @@ docker exec --user "$(id -u):$(id -g)" hicache-demo \
 |---|---|---|
 | `MODEL_ROOT`、`MODEL_DIR`、`SGLANG_DIR` | 两个启动入口 | 模型根目录、完整模型目录覆盖、源码 checkout；`SGLANG_DIR=''` 使用安装包 |
 | `GPU` | 启动入口 | Docker 选择物理卡；直接启动设置可见卡，省略则继承环境 |
-| `DTYPE`、`KV_DTYPE`、`TP` | `serve.sh` | 权重/KV 精度与 TP；当前 Driver 仅支持 TP=PP=DP=1 |
+| `DTYPE`、`KV_DTYPE`、`TP`、`EP` | `serve.sh` | 权重/KV 精度与 TP/EP；支持 TP=1/2/4、EP=1/TP，PP=DP=1 |
 | `CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION` | 启动环境，可覆盖配置 | 无配置名时默认 40960、36864、0.7 |
 | `HICACHE`、`HICACHE_SIZE`、`FORWARD_TIMING` | 启动环境，可覆盖配置 | 无配置名时默认 0、8 GB（十进制）、0；GPU 计时需开启 HiCache |
 | `--base-url`、`--tokenizer`、`--output-dir` | Driver | 服务地址、客户端 tokenizer、客户端结果目录 |

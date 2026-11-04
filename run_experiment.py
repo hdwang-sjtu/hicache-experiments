@@ -9,8 +9,8 @@
   analyze    读取已有结果重新汇总，不访问模型或服务器。
   self-test  用假 tokenizer 和假服务检查脚本逻辑，不做真实模型推理。
 
-约定：P 是可复用的历史前缀长度，S 是本次新增输入长度，S₀ 是预热用后缀。
-Cold 不预热；L1 先发送 P+S₀，再发送 P+S，且 S₀ 与 S 从首个 token 分叉。
+约定：P 是可复用的历史前缀长度，S 是本次新增输入长度。
+Cold 不预热；L1/L2 单独发送 P 建立检查点，再发送 P+S。
 L2 先确认 CPU 备份完成，再通过实验接口逐出 GPU。
 --gpu-timing 读取原生 CUDA Event 区间；--profile 单独诊断 Kernel 执行与加载重叠。
 """
@@ -34,6 +34,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+
+from rank_metrics import RankMetrics, check_state, rank_states
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,6 +71,7 @@ FIELDS = [
     "prompt_tokens", "completion_tokens", "cached_tokens", "device_tokens",
     "host_tokens", "storage_tokens", "num_retractions", *TIMES,
     "forward_entry_time", "prefill_finished_time", *LOAD_FIELDS, FORWARD_FIELD,
+    "tp", "ep", "prefill_forward_passes", "mamba_load_states",
     "device_tokens_before", "host_backed_tokens_before",
     "device_used_tokens_before", "host_used_tokens_before",
     "device_used_tokens_after", "host_used_tokens_after", "output_ids", "profiled", *ENV_FIELDS, "valid", "invalid_reason",
@@ -293,36 +296,25 @@ def tile(tokens, length):
 
 
 def make_cases(tokenizer, prefixes, suffixes, text):
-    """为每个 P/S 组合保存 prefix、测量 suffix、预热 suffix 和输入哈希。"""
+    """为每个 P/S 组合保存独立准备的 prefix、测量 suffix 和输入哈希。"""
     unit = tokenizer.encode(text, add_special_tokens=False)
     suffix = tokenizer.encode(
         "The next task is to review the recorded observations. ",
         add_special_tokens=False,
     )
-    warm = tokenizer.encode(
-        "Another task is to summarize the previous measurements. ",
-        add_special_tokens=False,
-    )
     special = set(tokenizer.all_special_ids)
-    if not unit or not suffix or not warm or special.intersection(unit + suffix + warm):
+    if not unit or not suffix or special.intersection(unit + suffix):
         raise ValueError("Input text must tokenize to nonempty, ordinary tokens")
-    # 两句文本分词后仍可能以相同 token 开头，因此显式选择不同的首 token。
-    # 这样 P+S₀ 和 P+S 只共享 P；不会把测量 suffix 也算成缓存命中。
-    alternate = next((token for token in warm if token != suffix[0]), None)
-    if alternate is None:
-        raise ValueError("Cannot construct suffixes with different first tokens")
     cases = []
     for p in prefixes:
         for s in suffixes:
-            measured, prepared = tile(suffix, s), tile(warm, s)
-            prepared[0] = alternate
+            measured = tile(suffix, s)
             prefix = tile(unit, p)
             cases.append(
                 dict(
                     id=f"p{p}_s{s}",
                     prefix=prefix,
                     suffix=measured,
-                    warm_suffix=prepared,
                     input_sha256=digest(prefix + measured),
                 )
             )
@@ -339,6 +331,7 @@ class Client:
         self.gpu_timing = False
         self.environment = None
         self.last_request_window = None
+        self.rank_metrics = None
 
     def request(self, path, payload=None, *, stage="control", parse_json=True):
         """发送一次请求，返回响应及客户端耗时；stage 用于区分记录的用途。
@@ -568,7 +561,7 @@ def validate(response, p, s, output_length, group):
 def execute_sample(client, case, group, output_length, stage="measure"):
     """执行一个完整样本：清空 → 按组准备 → 测量 P+S → 校验并组装 CSV 行。
 
-    Cold 直接测量；L1 先用 P+S₀ 把历史 P 留在 GPU，再测量 P+S。
+    Cold 直接测量；L1 单独准备 P 的 KV/线性状态，再测量 P+S。
     清空与准备请求均不计入测量请求的延迟。每次重复都重新准备缓存。
     """
     p, s = len(case["prefix"]), len(case["suffix"])
@@ -576,10 +569,19 @@ def execute_sample(client, case, group, output_length, stage="measure"):
     if environment is not None:
         environment.wait_ready()
     client.flush()
+    rank_reader = getattr(client, "rank_metrics", None)
     if group in ("l1", "l2"):
         # 预热请求本身应是 Cold；准备失败意味着测量起点不可靠，直接终止。
-        prepared, _, _ = client.generate(case["prefix"] + case["warm_suffix"], 1, "prepare")
-        errors, _ = validate(prepared, p, s, 1, "cold")
+        if rank_reader:
+            prepare_state = client.wait_cache(case["prefix"])
+            check_state(prepare_state, "cold", p, rank_reader.tp)
+            prepare_metrics = rank_reader.snapshot("prepare:metrics_before")
+        prepared, _, prepare_rid = client.generate(case["prefix"], 1, "prepare")
+        if rank_reader:
+            client.wait_cache(case["prefix"])
+            rank_reader.finish(prepare_metrics, "prepare", prepare_rid,
+                               p=p, s=0, group="cold", state=prepare_state)
+        errors, _ = validate(prepared, p, 0, 1, "cold")
         if errors:
             raise RuntimeError("Preparation failed: " + "; ".join(errors))
     before_state = None
@@ -587,6 +589,12 @@ def execute_sample(client, case, group, output_length, stage="measure"):
     if getattr(client, "hicache", False):
         # CPU 副本存在不等于搬运已完成；接口同时检查 Scheduler 和传输状态。
         before_state = client.wait_cache(case["prefix"])
+        if rank_reader:
+            for rank, value in rank_states(before_state, rank_reader.tp).items():
+                if value["device_free_tokens"] + value["device_used_tokens"] < p + s + output_length:
+                    raise RuntimeError(f"rank={rank} 实际 GPU KV 容量不足")
+        if rank_reader:
+            check_state(before_state, "cold" if group == "cold" else "l1", p, rank_reader.tp)
         expected = p if group in ("l1", "l2") else 0
         if (
             before_state["device_tokens"] != expected
@@ -596,6 +604,8 @@ def execute_sample(client, case, group, output_length, stage="measure"):
             raise RuntimeError(f"测量前缓存状态不符：{before_state}")
         if group == "l2":
             before_state = client.wait_cache(case["prefix"], demote=True)
+            if rank_reader:
+                check_state(before_state, "l2", p, rank_reader.tp)
             if (
                 before_state["device_tokens"] != 0
                 or before_state["host_hit_tokens"] != p
@@ -604,7 +614,7 @@ def execute_sample(client, case, group, output_length, stage="measure"):
                 raise RuntimeError(f"Demote 未产生纯 L2 起点：{before_state}")
         if environment is not None:
             environment.wait_ready()
-        before_metrics = client.load_metrics("metrics_before")
+        before_metrics = rank_reader.snapshot("metrics_before") if rank_reader else client.load_metrics("metrics_before")
     # 无论哪一组，发送的测量输入都完全相同。
     # 只采集 measure，请求预热、备份和 demote 都在 Profiler 区间外。
     profiled = stage == "measure" and bool(getattr(client, "profile_dir", None))
@@ -628,15 +638,20 @@ def execute_sample(client, case, group, output_length, stage="measure"):
     if before_state is not None:
         # 请求结束后等 ACK 被处理再读终值；等待本身不计入客户端请求延迟。
         after_state = client.wait_cache(case["prefix"])
-        after_metrics = client.load_metrics("metrics_after")
-        extra, load_errors = load_deltas(
-            before_metrics, after_metrics, p, before_state["kv_bytes_per_token"], group
-        )
-        errors.extend(load_errors)
-        if FORWARD_FIELD in before_metrics:
-            extra[FORWARD_FIELD] = after_metrics[FORWARD_FIELD] - before_metrics[FORWARD_FIELD]
-            if extra[FORWARD_FIELD] <= 0:
-                errors.append("Prefill CUDA Event 指标未增加或被重置")
+        if rank_reader:
+            extra = rank_reader.finish(before_metrics, stage, rid,
+                                       p=p, s=s, group=group, state=before_state)
+            extra.update(tp=rank_reader.tp, ep=rank_reader.ep)
+        else:
+            after_metrics = client.load_metrics("metrics_after")
+            extra, load_errors = load_deltas(
+                before_metrics, after_metrics, p, before_state["kv_bytes_per_token"], group
+            )
+            errors.extend(load_errors)
+            if FORWARD_FIELD in before_metrics:
+                extra[FORWARD_FIELD] = after_metrics[FORWARD_FIELD] - before_metrics[FORWARD_FIELD]
+                if extra[FORWARD_FIELD] <= 0:
+                    errors.append("Prefill CUDA Event 指标未增加或被重置")
         output_ids = result.get("output_ids")
         if (
             not isinstance(output_ids, list)
@@ -695,11 +710,10 @@ def execute_sample(client, case, group, output_length, stage="measure"):
 
 def check_server(info, cases, output_length, groups=None):
     """开始采样前检查服务配置、上下文长度、页对齐和可见的 KV 容量。"""
-    # 单卡、单请求使累计指标差值可以归属到当前测量请求。
+    # 单请求使各 rank 的累计指标差值可以归属到当前测量请求。
     required = dict(
         enable_metrics=True,
         disable_radix_cache=False,
-        tp_size=1,
         pp_size=1,
         dp_size=1,
         max_running_requests=1,
@@ -707,6 +721,11 @@ def check_server(info, cases, output_length, groups=None):
     for key, expected in required.items():
         if info.get(key) != expected:
             raise ValueError(f"Experiment requires server {key}={expected!r}; got {info.get(key)!r}")
+    tp, ep = info.get("tp_size"), info.get("ep_size", 1)
+    if tp not in (1, 2, 4) or ep not in (1, tp):
+        raise ValueError("实验支持 TP=1/2/4，EP=1 或 EP=TP")
+    if info.get("moe_dp_size", 1) != 1 or info.get("enable_dp_attention", False):
+        raise ValueError("实验要求关闭 MoE DP 和 attention DP")
     if info.get("enable_hierarchical_cache"):
         if (
             not info.get("enable_hicache_experiment")
@@ -740,6 +759,11 @@ def run_samples(client, cases, args, writer, file, common):
     rng = random.Random(args.seed)
     for case in cases:
         reference_output = None
+        if getattr(client, "rank_metrics", None) and "cold" not in args.groups:
+            reference = execute_sample(client, case, "cold", args.output_length, "reference")
+            if not reference["valid"]:
+                raise RuntimeError("Cold reference failed: " + reference["invalid_reason"])
+            reference_output = reference["output_ids"]
         # 这里的 warmup 用于预热运行路径，不写入 samples.csv。
         # 它与 execute_sample 内每次 L1 都要执行的 prepare 请求不同。
         for _ in range(args.warmup_rounds):
@@ -747,9 +771,10 @@ def run_samples(client, cases, args, writer, file, common):
                 row = execute_sample(client, case, group, args.output_length, "warmup")
                 if not row["valid"]:
                     raise RuntimeError("Warmup failed: " + row["invalid_reason"])
-                if group == "cold" or reference_output is None:
-                    # 有 Cold 对照时以其输出为准，不让随机先运行的 L2 成为错误参考。
+                if reference_output is None:
                     reference_output = row["output_ids"]
+                elif row["output_ids"] != reference_output:
+                    raise RuntimeError("Warmup Cold/L1/L2 输出 token 不一致")
         valid = dict.fromkeys(args.groups, 0)
         attempts = dict.fromkeys(args.groups, 0)
         while any(valid[g] < args.repeats for g in args.groups):
@@ -1181,10 +1206,11 @@ def run(args):
         except importlib.metadata.PackageNotFoundError:
             pass
     write_json(config_path, config)
-    # 客户端可以只有这一个文件；启动脚本的快照由服务端自行保存。
+    # 客户端保存 Driver 及指标模块；启动脚本的快照由服务端自行保存。
     source = directory / "source"
     source.mkdir()
     shutil.copyfile(Path(__file__), source / "run_experiment.py")
+    shutil.copyfile(Path(__file__).with_name("rank_metrics.py"), source / "rank_metrics.py")
     try:
         attach_server_artifacts(directory, launch_dir, config)
         if args.telemetry_dir:
@@ -1232,15 +1258,37 @@ def run(args):
             )
             # 4. 按实际服务配置检查输入是否合法，再进入测量。
             check_server(info, cases, args.output_length, args.groups)
+            model_config_path = Path(args.tokenizer) / "config.json"
+            model_config = json.loads(model_config_path.read_text()) if model_config_path.is_file() else {}
+            text_config = model_config.get("text_config", model_config)
+            hybrid = "qwen3_5" in text_config.get("model_type", "")
+            if hybrid or info["tp_size"] > 1:
+                if not args.gpu_timing or args.output_length != 1:
+                    raise ValueError("混合/多卡实验要求 GPU timing 和单 token 输出")
+                chunk = info.get("chunked_prefill_size")
+                grid = math.lcm(info["page_size"], text_config.get("mamba_chunk_size", 64))
+                if (not isinstance(chunk, int) or chunk <= 0 or info.get("enable_dynamic_chunking")
+                        or max(args.suffix_lengths) > chunk):
+                    raise ValueError("需要固定正数 chunk，且 S 不大于 chunk")
+                if hybrid and (info.get("mamba_radix_cache_strategy") != "extra_buffer"
+                               or any(p % grid for p in args.prefix_lengths) or chunk % grid):
+                    raise ValueError("混合缓存需要 extra_buffer 及按实际 checkpoint 网格对齐的 P/chunk")
+                if info["tp_size"] > 1 and not info.get("enable_metrics_for_all_schedulers"):
+                    raise ValueError("多卡实验需要所有 scheduler 的指标")
+                capacities = [info.get("max_total_num_tokens")] + [v.get("memory_usage", {}).get("token_capacity") for v in info.get("internal_states", [])]
+                if not capacities or any(not isinstance(v, int) or v < max(args.prefix_lengths)+max(args.suffix_lengths)+1 for v in capacities):
+                    raise ValueError(f"实际 KV 容量不足或缺失：{capacities}")
             client.hicache = bool(info.get("enable_hierarchical_cache"))
             if args.gpu_timing:
                 if not client.hicache:
                     raise ValueError("GPU 时间归属依赖 HiCache 空闲检查，请启用 HICACHE=1")
-                # 短请求建立原生 extend 指标，并等完成后读取；不进入采样 CSV。
-                client.generate(cases[0]["prefix"][:32], 1, "timing_init")
-                client.wait_cache(cases[0]["prefix"][:32])
+                # 用完整 P 建立原生 extend 指标，并等完成后读取；不进入采样 CSV。
+                client.flush()
+                client.generate(cases[0]["prefix"], 1, "timing_init")
+                client.wait_cache(cases[0]["prefix"])
                 client.gpu_timing = True
-                client.load_metrics("timing_init_metrics")
+                client.rank_metrics = RankMetrics(client, info, hybrid, directory / "rank-metrics.jsonl")
+                client.rank_metrics.snapshot("timing_init_metrics")
             config["phase"] = "cold_l1_l2_hicache" if client.hicache else "cold_l1_no_hicache"
             common = dict(
                 model=config["model"],
@@ -1285,19 +1333,18 @@ def self_test():
     from types import SimpleNamespace
 
     class Tokenizer:
-        """仅用于自测输入长度与分叉位置，不能代替 Qwen 的真实分词器。"""
+        """仅用于自测输入长度，不能代替 Qwen 的真实分词器。"""
 
         all_special_ids = []
 
         def encode(self, text, **kwargs):
             return list(text.encode())
 
-    # 检查不同 P/S 下的首个分叉位置；这里用 8、16 等小长度加快自测。
+    # 检查不同 P/S 的精确长度；准备输入是独立 P。
     cases = make_cases(Tokenizer(), [8, 16], [2, 4], "fixed text")
     for c in cases:
-        a, b = c["prefix"] + c["suffix"], c["prefix"] + c["warm_suffix"]
-        assert next(i for i, (x, y) in enumerate(zip(a, b)) if x != y) == len(c["prefix"])
-        assert len(a) == len(b)
+        assert len(c["prefix"]) in (8, 16) and len(c["suffix"]) in (2, 4)
+        assert digest(c["prefix"] + c["suffix"]) == c["input_sha256"]
 
     class FakeClient:
         """模拟缓存状态和响应字段；不执行任何 GPU/CPU 模型推理。"""
@@ -1389,7 +1436,7 @@ def self_test():
     check_server(server, cases, 1)
     for changes in ({"context_length": 10}, {"page_size": 32},
                     {"enable_hierarchical_cache": True}, {"max_total_num_tokens": 8},
-                    {"tp_size": 2}, {"enable_metrics": False}):
+                    {"tp_size": 3}, {"enable_metrics": False}):
         try:
             check_server({**server, **changes}, cases, 1)
         except ValueError:

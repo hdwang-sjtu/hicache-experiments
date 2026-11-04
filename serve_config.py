@@ -12,7 +12,8 @@ import sys
 CONFIG_DIR = Path(__file__).resolve().parent / "configs/serve"
 # 兼容原来的显式环境变量；没有设置的变量不产生默认值，不覆盖 YAML。
 ENV_OPTIONS = {
-    "HOST": ("host", str), "PORT": ("port", int), "TP": ("tp-size", int),
+    "HOST": ("host", str), "PORT": ("port", int), "TP": ("tp-size", int), "EP": ("ep-size", int),
+    "CHUNKED_PREFILL_SIZE": ("chunked-prefill-size", int),
     "DTYPE": ("dtype", str), "KV_DTYPE": ("kv-cache-dtype", str),
     "CONTEXT_LENGTH": ("context-length", int), "MAX_TOTAL_TOKENS": ("max-total-tokens", int),
     "MEM_FRACTION": ("mem-fraction-static", float), "HICACHE_SIZE": ("hicache-size", float),

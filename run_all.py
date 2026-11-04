@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,7 @@ import urllib.request
 import uuid
 
 from prepare_runtime import cache_lock, write_json
+from rank_metrics import metric_delta
 import run_experiment as driver
 import serve_config
 
@@ -32,7 +34,7 @@ TEST_OPTIONS = {
     "warmup-rounds", "seed", "timeout", "ready-timeout", "no-plot", "gpu-timing", "note", "text-file",
 }
 CODE_FILES = ("run_all.py", "prepare_runtime.py", "run_experiment.py", "serve_config.py",
-              "launch_metadata.py", "serve.sh", "launch_server.sh")
+              "launch_metadata.py", "serve.sh", "launch_server.sh", "rank_metrics.py")
 
 
 def named(name):
@@ -117,9 +119,30 @@ def verify_results(directory, expected):
     wanted = {(p, s, group): expected.repeats for p in expected.prefix_lengths
               for s in expected.suffix_lengths for group in expected.groups}
     counts = Counter()
+    records = {}
+    if expected.gpu_timing:
+        path = directory / "rank-metrics.jsonl"
+        if not path.is_file():
+            raise RuntimeError("缺少逐 rank 指标归档")
+        for line in path.read_text().splitlines():
+            record = json.loads(line)
+            if record["request_id"] in records:
+                raise RuntimeError("重复的逐 rank 请求记录")
+            records[record["request_id"]] = record
+        required.append("rank-metrics.jsonl")
     with (directory / "samples.csv").open() as file:
         for row in csv.DictReader(file):
             if row["valid"] == "True":
+                if expected.gpu_timing:
+                    record = records[row["request_id"]]
+                    before = {int(k): v for k, v in record["before"].items()}
+                    after = {int(k): v for k, v in record["after"].items()}
+                    if set(before) != set(range(record["tp"])):
+                        raise RuntimeError("归档缺少 TP rank")
+                    delta = metric_delta(before, after, **record["expected"])
+                    value = max(v["seconds"] for v in delta.values()) * 1000
+                    if not math.isclose(value, float(row["prefill_forward_gpu_ms"])):
+                        raise RuntimeError("CSV 与逐 rank 计时不符")
                 counts[(int(row["prefix_length"]), int(row["suffix_length"]), row["group"])] += 1
     if dict(counts) != wanted:
         raise RuntimeError(f"有效样本未满足实验配置：{dict(counts)}")
@@ -132,6 +155,40 @@ class TaskInterrupted(Exception):
         super().__init__(f"收到信号 {signal.Signals(signum).name}")
 
 
+class MemoryMonitor:
+    """Sample startup and request peaks; sampled NVML values are not allocation maxima."""
+    def __init__(self, root, state):
+        self.root, self.state = root, state
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.peaks = {}
+
+    def run(self):
+        with (self.root / "gpu-memory.jsonl").open("a", buffering=1) as log:
+            while not self.stop.is_set():
+                record = dict(utc=datetime.now(timezone.utc).isoformat(), phase=self.state["phase"])
+                try:
+                    output = subprocess.check_output(
+                        ["nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total,utilization.gpu",
+                         "--format=csv,noheader,nounits"], text=True, stderr=subprocess.PIPE, timeout=5)
+                    gpus = []
+                    for line in output.splitlines():
+                        index, uuid_value, used, total, util = [v.strip() for v in line.split(",")]
+                        value = dict(index=int(index), uuid=uuid_value, used_mib=int(used), total_mib=int(total), utilization=int(util))
+                        gpus.append(value)
+                        self.peaks[uuid_value] = max(self.peaks.get(uuid_value, 0), value["used_mib"])
+                    record["gpus"] = gpus
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    record["error"] = str(exc)
+                log.write(json.dumps(record) + "\n")
+                self.stop.wait(.5)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=7)
+        self.state["sampled_gpu_peak_mib"] = self.peaks
+
+
 class Job:
     """只编排本次拥有的子进程/容器；不连接已有服务或调用云平台管理 API。"""
 
@@ -140,8 +197,16 @@ class Job:
         self.args = args
         self.env = dict(os.environ if environ is None else environ)
         self.experiment_path, self.experiment = load_experiment(args.experiment, self.project)
+        for key in ("prefix_lengths", "suffix_lengths", "groups", "repeats", "no_plot"):
+            value = getattr(args, key, None)
+            if value is not None:
+                self.experiment["test"][key.replace("_", "-")] = value
         self.test_argv, self.test = test_arguments(self.experiment["test"])
         self.lock = json.loads((self.project / "configs/runtime.lock.json").read_text())
+        if getattr(args, "image", None):
+            self.lock["image"] = args.image
+        if getattr(args, "source_repository", None):
+            self.lock["sglang_repository"] = args.source_repository
         patch = self.project / self.lock["patch"]
         if hashlib.sha256(patch.read_bytes()).hexdigest() != self.lock["patch_sha256"]:
             raise ValueError("版本锁中的补丁哈希不匹配")
@@ -149,13 +214,46 @@ class Job:
         model_root = Path(self.env.get("MODEL_ROOT", str(self.cache / "models"))).expanduser().resolve()
         # 版本化目录避免覆盖手工准备的同名模型或将不同 revision 混在一起。
         _, _, profile = serve_config.read_profile(self.experiment["serve"], self.project / "configs/serve")
-        self.model = model_root / profile["model"] / self.experiment["model"]["revision"]
-        if self.env.get("MODEL_DIR") and Path(self.env["MODEL_DIR"]).expanduser().resolve() != self.model:
-            raise ValueError("一键任务按固定 revision 管理模型；请取消 MODEL_DIR，使用 MODEL_ROOT 指定缓存根目录")
+        local = getattr(args, "model_dir", None) or self.env.get("MODEL_DIR")
+        self.local_model = bool(local)
+        self.model = (Path(local).expanduser().resolve() if local else
+                      model_root / profile["model"] / self.experiment["model"]["revision"])
         self.env["MODEL_DIR"] = str(self.model)
+        for key, env_key in dict(tp="TP", ep="EP", context_length="CONTEXT_LENGTH",
+                                max_total_tokens="MAX_TOTAL_TOKENS", chunked_prefill_size="CHUNKED_PREFILL_SIZE",
+                                mem_fraction="MEM_FRACTION", hicache_size="HICACHE_SIZE", gpu="GPU", port="PORT").items():
+            if getattr(args, key, None) is not None:
+                self.env[env_key] = str(getattr(args, key))
         self.resolution = serve_config.resolve(self.experiment["serve"], args.runtime, [], self.env,
                                                self.project / "configs/serve")
         server = self.resolution["server"]
+        hybrid = "mamba-radix-cache-strategy" in server
+        if hybrid:
+            required = max(self.test.prefix_lengths) + max(self.test.suffix_lengths) + self.test.output_length
+            defaults = {"context-length": max(16384, ((required + 2047) // 2048) * 2048)}
+            defaults["max-total-tokens"] = max(32768, defaults["context-length"])
+            for key, value in defaults.items():
+                variable = "CONTEXT_LENGTH" if key == "context-length" else "MAX_TOTAL_TOKENS"
+                if variable not in self.env:
+                    server[key] = max(server.get(key) or 0, value)
+            if "CHUNKED_PREFILL_SIZE" not in self.env:
+                server["chunked-prefill-size"] = min(server["context-length"], 32768)
+            if (self.test.output_length != 1 or not self.test.gpu_timing
+                    or not server.get("enable-hierarchical-cache")):
+                raise ValueError("混合缓存实验要求 HiCache、GPU timing 和单 token 输出")
+            if min(server["context-length"], server["max-total-tokens"]) < required:
+                raise ValueError("实际配置容量必须至少为 P+S+1")
+            chunk = server["chunked-prefill-size"]
+            if chunk <= 0 or chunk > server["context-length"] or chunk % 256:
+                raise ValueError("chunk 必须为 256 的正整数倍且不超过 context")
+            if max(self.test.suffix_lengths) > chunk:
+                raise ValueError("S 超过 chunk；L1/L2 后缀要求一次 Forward")
+            if any(p % 256 for p in self.test.prefix_lengths):
+                raise ValueError("Qwen3.5 前缀需按 256 对齐")
+            server["max-prefill-tokens"] = server["context-length"]
+        tp, ep = server.get("tp-size", 1), server.get("ep-size", 1)
+        if tp not in (1, 2, 4) or ep not in (1, tp):
+            raise ValueError("支持 TP=1/2/4、EP=1 或 EP=TP")
         self.host, self.port = server.get("host", "127.0.0.1"), int(server.get("port", 39081))
         if self.host not in ("127.0.0.1", "localhost", "0.0.0.0", "::", "::1") or not 0 < self.port < 65536:
             raise ValueError("一键任务只启动当前主机服务，请使用 loopback 或通配监听地址及有效端口")
@@ -206,7 +304,15 @@ class Job:
             self.state["code_sha256"][name] = hashlib.sha256(content).hexdigest()
         profiles = self.code / "configs/serve"
         profiles.mkdir(parents=True)
-        (profiles / (self.experiment["serve"] + ".yaml")).write_text(self.resolution["source_text"])
+        # Freeze resolved values, including CLI overrides and adaptive capacity.
+        frozen = dict(self.resolution["server"])
+        frozen.pop("model-path", None)
+        _, _, profile = serve_config.read_profile(self.experiment["serve"], self.project / "configs/serve")
+        profile.update(sglang=frozen, env=self.resolution["environment"])
+        (profiles / (self.experiment["serve"] + ".yaml")).write_text(
+            serve_config.yaml_module().safe_dump(profile, allow_unicode=True, sort_keys=False))
+        (self.root / "serve-original.yaml").write_text(self.resolution["source_text"])
+        write_json(self.root / "resolved-experiment.json", self.experiment)
         (self.root / "experiment.yaml").write_bytes(self.experiment_path.read_bytes())
         write_json(self.root / "runtime.lock.json", self.lock)
         shutil.copyfile(self.project / self.lock["patch"], self.root / "sglang.patch")
@@ -276,9 +382,13 @@ class Job:
         self.state["source"] = json.loads((self.root / "source.json").read_text())
         self.env["SGLANG_DIR"] = self.state["source"]["path"]
         self.phase("preparing_model")
-        self.command([sys.executable, str(self.code / "prepare_runtime.py"), "model", "--directory", str(self.model),
-                      "--repo", self.experiment["model"]["repo"], "--revision", self.experiment["model"]["revision"],
-                      "--output", str(self.root / "model.json")], timeout=7200)
+        model_command = [sys.executable, str(self.code / "prepare_runtime.py"),
+                         "inspect-model" if self.local_model else "model", "--directory", str(self.model),
+                         "--output", str(self.root / "model.json")]
+        if not self.local_model:
+            model_command += ["--repo", self.experiment["model"]["repo"],
+                              "--revision", self.experiment["model"]["revision"]]
+        self.command(model_command, timeout=7200)
         self.state["model"] = json.loads((self.root / "model.json").read_text())
 
     def wait_ready(self):
@@ -379,6 +489,7 @@ class Job:
         self.root.mkdir(exist_ok=False)
         locks = ExitStack()
         previous_handlers = {}
+        monitor = None
         exit_code = 1
         def interrupted(signum, _frame):
             raise TaskInterrupted(signum)
@@ -391,6 +502,8 @@ class Job:
             self.prepare()
             ensure_port_free(self.host, self.port)
             self.phase("starting_server")
+            monitor = MemoryMonitor(self.root, self.state)
+            monitor.thread.start()
             launcher = "serve.sh" if self.args.runtime == "native" else "launch_server.sh"
             self.server = self.start(["bash", str(self.code / launcher), self.experiment["serve"],
                                       "--served-model-name", self.identity], "server-launch.log")
@@ -417,6 +530,8 @@ class Job:
                 if exit_code == 0:
                     self.state.update(status="failed", failed_phase="cleanup")
                     exit_code = 1
+            if monitor is not None:
+                monitor.close()
             locks.close()
             if exit_code == 0:
                 self.state["status"] = "complete"
@@ -435,6 +550,23 @@ def main():
     parser.add_argument("--run-id", help="本轮独立目录名，不能覆盖已有任务")
     parser.add_argument("--dry-run", action="store_true", help="只检查配置和显示任务，不联网、不启动、不写目录")
     parser.add_argument("--list-experiments", action="store_true")
+    parser.add_argument("--model-dir", help="只读使用现有本地模型，不下载或重写权重")
+    parser.add_argument("--image", help="Docker 镜像覆盖；记录实际 image ID")
+    parser.add_argument("--source-repository", help="固定基线的 Git 来源，可使用本地仓库离线准备")
+    parser.add_argument("--gpu", help="GPU 编号列表，例如 0,1,2,3")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--tp", type=int, choices=[1, 2, 4])
+    parser.add_argument("--ep", type=int, choices=[1, 2, 4])
+    parser.add_argument("--prefix-lengths", nargs="+", type=driver.positive_length)
+    parser.add_argument("--suffix-lengths", nargs="+", type=driver.positive_length)
+    parser.add_argument("--groups", nargs="+", choices=["cold", "l1", "l2"])
+    parser.add_argument("--repeats", type=driver.positive_length)
+    parser.add_argument("--context-length", type=driver.positive_length)
+    parser.add_argument("--max-total-tokens", type=driver.positive_length)
+    parser.add_argument("--chunked-prefill-size", type=driver.positive_length)
+    parser.add_argument("--mem-fraction", type=float)
+    parser.add_argument("--hicache-size", type=float, help="每 rank 的主机缓存 GB")
+    parser.add_argument("--no-plot", action="store_true", default=None)
     args = parser.parse_args()
     if args.list_experiments:
         print("\n".join(p.stem for p in sorted((PROJECT / "configs/experiments").glob("*.yaml"))))

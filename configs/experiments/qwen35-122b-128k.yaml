@@ -1,0 +1,17 @@
+serve: qwen35-122b
+model:
+  repo: Qwen/Qwen3.5-122B-A10B-FP8
+  revision: a099dee70ccfcd8d5dda56aaa0b60cb8ecadabc9
+test:
+  prefix-lengths:
+  - 128k
+  suffix-lengths:
+  - 2048
+  groups:
+  - cold
+  - l1
+  - l2
+  output-length: 1
+  repeats: 3
+  gpu-timing: true
+  ready-timeout: 1800

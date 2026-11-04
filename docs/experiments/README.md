@@ -9,6 +9,7 @@
 
 | 实验 | 状态 | 原始数据 |
 |---|---|---|
+| [2026-11-05：Qwen3.5 统一入口 TP/EP 验收](2026-11-05-qwen35-unified.md) | 35B 五种组合共 180 个、122B 长前缀 9 个有效样本 | `results/unified-qwen35/` |
 | [Cold/L1 基线与 L2 验收](baseline-and-l2.md) | 基线 120 个、L2 180 个正式有效样本；另有流程验证和失败尝试 | `results/baseline-*`、`results/l2-*` |
 | [2026-10-31：GPU 计时与固定 P 扫描 S](2026-10-31-gpu-timing.md) | 240 个正式有效样本，Profiler 独立保存 | `results/timing-*` |
 | [2026-11-01：8K–128K Prefix 扫描](2026-11-01-prefix-scan-128k.md) | 480 个缓存有效样本；性能隔离存在监控缺口 | `results/prefix-scan-128k`、`results/prefix128k-*` |

@@ -17,8 +17,8 @@
 ```text
 main()                       解析 run / analyze / self-test 子命令
 └── run()                    准备目录和输入，等待并检查服务，保存最终状态
-    ├── make_cases()         构造精确的 P、S、S₀，保证只共享 P 个 token
-    ├── check_server()       检查单卡、单请求、上下文长度和 KV 容量
+    ├── make_cases()         构造精确 P、S，单独准备 P
+    ├── check_server()       检查 TP/EP、单请求、上下文长度和 KV 容量
     ├── run_samples()        执行运行预热，收集每组所需的有效测量
     │   └── execute_sample() 清空缓存 → 按组准备 → 测量 → 校验
     │       ├── Client      发送 HTTP 请求并保存原始响应
@@ -26,7 +26,7 @@ main()                       解析 run / analyze / self-test 子命令
     └── analyze()            过滤无效样本，输出 Median、P95 和图表
 ```
 
-有两种容易混淆的“预热”：`warmup` 是每个长度组合开始时的运行预热，不写入测量 CSV；`prepare` 是每一次 L1 样本都必须重新做的 P+S₀ 请求，用来构造缓存状态。
+有两种容易混淆的“预热”：`warmup` 是每个长度组合开始时的运行预热，不写入测量 CSV；`prepare` 是每一次 L1 样本都必须重新做的 P 请求，用来构造缓存状态。
 `measure` 才是计入 CSV 的 P+S 请求，且其清空和准备耗时不计入客户端测量延迟。
 
 函数说明、关键流程和命令行帮助使用中文。变量、CSV 字段和图表标签保留英文；内置测试语料也保持原文，以免修改注释时改变输入。
@@ -84,8 +84,8 @@ JSON/IPC 传入的 token IDs 是 `list`；接口在匹配前转换为 serving �
 | 组别 | 准备操作 | 测量请求的实际命中要求 |
 |---|---|---|
 | Cold | 清空 → 确认空闲 | device=0，host=0 |
-| L1 | 清空 → P+S₀ → 等待 CPU 备份完成 | device=P，host=0 |
-| L2 | 清空 → P+S₀ → 等待备份 → Demote | device=0，host=P |
+| L1 | 清空 → P → 等待 CPU 备份完成 | device=P，host=0 |
+| L2 | 清空 → P → 等待备份 → Demote | device=0，host=P |
 
 注意：L1 的 CPU **备份覆盖**也等于 P，但请求实际 **host 命中**为 0，因为 GPU 已有副本。脚本分别记录这两个量。
 
@@ -99,7 +99,7 @@ GPU=1 MODEL_DIR=/path/to/local/model DTYPE=bfloat16 KV_DTYPE=bfloat16 \
 ```
 
 可覆盖 `SGLANG_DIR`、`IMAGE`、`PORT`、`CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION`、`RESULTS_DIR`。
-`TP` 是启动参数；目前 Driver 为了保证实验归属，仅接受 TP=PP=DP=1。
+`TP`/`EP` 是启动参数；Driver 支持 TP=1/2/4、EP=1/TP，要求 PP=DP=1。多 rank 必须启用所有 scheduler 指标与 GPU timing。
 无配置名时默认上下文 40960、KV 容量上限 36864 tokens、chunk size 4096、并发 1、Graph 关闭、overlap 保留。
 `qwen3-8b-4k` 则使用 4096 总上下文和 8192 KV 槽位，应使用 P=2K 的小点验收，不能照搬本页旧模式的 8K/32K 命令。
 其他模型需自行设置正确上下文长度，dtype 必须由模型及所用后端支持。
@@ -218,9 +218,9 @@ Driver 本身不负责后台作业编排。`run_all.py` 管理整轮服务和测
 每个 P/S 组合先对所选组各执行一次运行预热，不计入 CSV。每次测量分别执行：
 
 1. Cold：确认缓存清空成功 → 发送 P+S。
-2. L1：确认缓存清空成功 → 发送 P+S₀ 生成 1 token → 发送相同测量输入 P+S。
+2. L1：确认缓存清空成功 → 发送 P 生成 1 token → 发送相同测量输入 P+S。
 
-S₀ 和 S 的第一个 token 保证不同。每次重复都重新准备，避免上次的 S 也被缓存。
+准备请求只处理 P。每次重复都清空后重新准备，避免上次的 S 也被缓存。
 每轮随机化组顺序（种子可复现），单请求串行执行。
 
 有效样本必须满足：
@@ -228,7 +228,7 @@ S₀ 和 S 的第一个 token 保证不同。每次重复都重新准备，避�
 - 输入 tokens = P+S，输出 tokens = 指定值，正常到达长度限制；temperature=0、ignore_eos=true。
 - Cold 总命中 / device / host / storage 均为 0。
 - L1 总命中和 device 恰好为 P，host / storage 为 0。
-- L2 总命中和 host 恰好为 P，device / storage 为 0；实际 H2D tokens=P、字节数=P×池的每 token 字节数。
+- L2 总命中和 host 恰好为 P，device / storage 为 0；实际 KV H2D tokens=P；字节数还需包括混合模型的线性状态，逐 rank 校验后合计。
 - 回撤次数为 0；服务端必须返回完整、有效的时间统计。
 - 相同 P/S 的有效测量应生成相同 token IDs；L2 模式要求开启 `--return-output-ids`（启动器已设置）。
 
@@ -249,14 +249,14 @@ S₀ 和 S 的第一个 token 保证不同。每次重复都重新准备，避�
 | `queue_ms` | 请求在调度等待队列中的累计时间 |
 | `forward_entry_time` / `prefill_finished_time` | 原样保存的服务端时间戳（秒）；不当作 CUDA Event 时间 |
 | `kv_load_ms` | 请求前后 `load_back_duration_seconds_sum` 差值转成 ms，表示已完成 H2D 操作的 GPU-stream 区间累计值 |
-| `kv_load_tokens` / `kv_load_bytes` | 本次请求实际完成的 H2D token 数 / KV payload 字节数 |
+| `kv_load_tokens` / `kv_load_bytes` | 逻辑 KV H2D token 数 / 所有 rank 的 KV 与线性状态恢复字节合计 |
 | `kv_load_ops` | 本次请求完成并带有 CUDA Event 时间的 H2D 操作数 |
 | `prefill_forward_gpu_ms` | 可选；原生 extend CUDA Event 累计指标的请求前后差值。Cold 累加全部 chunk；L1/L2 只计算 S，但 L2 区间可能等待 KV |
 | `device_tokens_before` / `host_backed_tokens_before` | 准备结束后，目标 P 在 GPU 上的命中 / CPU 上的备份覆盖 |
 | `device_used_tokens_before/after` / `host_used_tokens_before/after` | 请求前后，缓存池中已用的 token 槽位数，不是 CUDA allocator 占用字节数 |
 
 HiCache 模式下，接口先确认空闲，脚本再读取 `/metrics` 基准；测量请求结束后等 ACK 被处理，再读取终值。两个指标快照之间没有 flush，也不包含其他测量请求。
-指标按单 rank 和 KV 池读取，不把多 rank 或其他 pool 的计数混加。首次加载前显式初始化零值；缺失、重复、倒退或传输量不符时，不得作为有效样本。
+GPU timing 任务逐 rank 读取 KV/Mamba 池与 forward 指标；时间取最大 rank，逻辑 token 数不累加，字节数合计。未启用 GPU timing 的旧 FULL-KV 单卡路径只读取 KV 指标。首次加载前显式初始化零值；缺失、重复、倒退或传输量不符时，不得作为有效样本。
 H2D 时间包含逐层提交之间的空隙，但不含之前的排队、索引准备和 fence 等待；它可与 Prefill 重叠，不能直接与首 token 延迟相加。
 关闭 HiCache 的旧结果没有这些测量，新列留空；`analyze` 继续兼容原 CSV。
 
@@ -280,3 +280,5 @@ Median 和 P95 仅对有效样本计算；P95 使用排序后线性插值。少�
 
 目录不得复用。失败尝试保留原始数据并标明状态，不计为已完成实验。
 一个服务可对应多个测量目录，后续目录关联原始启动信息；没有启动证据时无法证明镜像和源码版本。
+
+混合注意力、多 rank 的状态与指标规则见 [Qwen3.5 实验](qwen35.md)。旧记录中的 P+S₀ 方法属于当时的 FULL-KV 实验，新入口使用独立 P 准备。

@@ -1,0 +1,36 @@
+model: Qwen3.5-122B-A10B-FP8
+env:
+  SGLANG_ENABLE_METRICS_DEVICE_TIMER: '1'
+  SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND: python
+sglang:
+  context-length: 135168
+  max-total-tokens: 135168
+  dtype: bfloat16
+  kv-cache-dtype: bfloat16
+  tp-size: 4
+  host: 127.0.0.1
+  port: 39081
+  mem-fraction-static: 0.8
+  max-running-requests: 1
+  chunked-prefill-size: 32768
+  page-size: 1
+  cuda-graph-backend-decode: disabled
+  cuda-graph-backend-prefill: disabled
+  enable-metrics: true
+  return-output-ids: true
+  enable-hierarchical-cache: true
+  enable-hicache-experiment: true
+  hicache-host-memory-mode: cache
+  hicache-write-policy: write_through
+  hicache-size: 8
+  hicache-io-backend: kernel
+  hicache-mem-layout: page_first
+  ep-size: 4
+  pp-size: 1
+  dp-size: 1
+  max-mamba-cache-size: 32
+  mamba-radix-cache-strategy: extra_buffer
+  mamba-track-interval: 256
+  enable-metrics-for-all-schedulers: true
+  skip-server-warmup: true
+  random-seed: 0

@@ -146,6 +146,7 @@ class RemoteClient(unittest.TestCase):
         self.root = Path(self.temp.name)
         # 只复制客户端，不提供 serve.sh、Docker、SGLang 或模型权重。
         shutil.copyfile(PROJECT / "run_experiment.py", self.root / "run_experiment.py")
+        shutil.copyfile(PROJECT / "rank_metrics.py", self.root / "rank_metrics.py")
         (self.root / "transformers.py").write_text('''
 class AutoTokenizer:
     all_special_ids = []
@@ -229,7 +230,7 @@ class AutoTokenizer:
             rows = list(csv.DictReader(file))
         self.assertEqual(len(rows), 16)
         self.assertTrue(all(row["valid"] == "True" for row in rows))
-        self.assertEqual([p.name for p in (self.root / "results/source").iterdir()], ["run_experiment.py"])
+        self.assertEqual(sorted(p.name for p in (self.root / "results/source").iterdir()), ["rank_metrics.py", "run_experiment.py"])
 
     def test_profile_path_belongs_to_server_and_artifacts_are_optional_copies(self):
         artifacts = self.root / "copied-launch"

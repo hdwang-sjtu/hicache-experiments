@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import struct
 import tempfile
 
 DIFF_ARGS = ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv",
@@ -119,6 +120,54 @@ def model_inventory(directory):
             and path.name not in (".hicache-model.json", ".hicache-model.json.tmp")}
 
 
+def inspect_model(path):
+    """索引/大小 + safetensors header 边界检查，不声称已做全权重哈希。"""
+    path = Path(path).resolve()
+    inventory = model_inventory(path)
+    if any(path.rglob('*.incomplete')):
+        raise ValueError('模型目录存在未完成下载文件')
+    weights = sorted(path.glob('*.safetensors'))
+    if not weights:
+        raise ValueError('本入口需要 safetensors 权重')
+    index = path / 'model.safetensors.index.json'
+    mapping = json.loads(index.read_text())['weight_map'] if index.exists() else None
+    tensor_names = set()
+    for weight in weights:
+        with weight.open('rb') as f:
+            prefix = f.read(8)
+            if len(prefix) != 8:
+                raise ValueError(f'无效 safetensors header: {weight.name}')
+            size = struct.unpack('<Q', prefix)[0]
+            if not 0 < size < min(weight.stat().st_size, 100_000_000):
+                raise ValueError(f'无效 safetensors header 长度: {weight.name}')
+            header = json.loads(f.read(size))
+        end = weight.stat().st_size - 8 - size
+        for name, tensor in header.items():
+            if name == '__metadata__':
+                continue
+            start, stop = tensor['data_offsets']
+            if not 0 <= start < stop <= end or name in tensor_names:
+                raise ValueError(f'损坏或重复 tensor: {name}')
+            if mapping and mapping.get(name) != weight.name:
+                raise ValueError(f'tensor 与分片索引不一致: {name}')
+            tensor_names.add(name)
+    if mapping and tensor_names != set(mapping):
+        raise ValueError('分片中缺少索引指定的 tensor')
+    revisions = set()
+    metadata = path / '.cache/huggingface/download'
+    for item in metadata.glob('*.metadata'):
+        first = next(iter(item.read_text().splitlines()), '')
+        if re.fullmatch('[0-9a-f]{40}', first):
+            revisions.add(first)
+    config = json.loads((path / 'config.json').read_text())
+    text_config = config.get('text_config', config)
+    return dict(path=str(path), files=inventory, weight_bytes=sum(w.stat().st_size for w in weights),
+                revision=next(iter(revisions)) if len(revisions) == 1 else None,
+                revision_evidence='local HF metadata (not full content hash)',
+                config_sha256=hashlib.sha256((path / 'config.json').read_bytes()).hexdigest(),
+                model_type=text_config.get('model_type'), state_chunk_size=text_config.get('mamba_chunk_size', 64))
+
+
 def prepare_model(directory, repo, revision, downloader=None):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("模型 revision 必须是固定的完整 commit SHA")
@@ -167,9 +216,14 @@ def main():
     model.add_argument("--repo", required=True)
     model.add_argument("--revision", required=True)
     model.add_argument("--output", type=Path, required=True)
+    local = sub.add_parser("inspect-model")
+    local.add_argument("--directory", type=Path, required=True)
+    local.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.action == "source":
         result = prepare_source(args.cache, json.loads(args.lock.read_text()), args.patch)
+    elif args.action == "inspect-model":
+        result = dict(inspect_model(args.directory), source="local-readonly", reused=True)
     else:
         result = prepare_model(args.directory, args.repo, args.revision)
     write_json(args.output, result)
