@@ -9,6 +9,8 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,7 +20,7 @@ import yaml
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
-from prepare_runtime import prepare_model
+from prepare_runtime import docker_model_mount, inspect_model, prepare_model
 from run_all import CODE_FILES, Job, verify_results
 
 # 提供就绪状态和任务身份，供真实总控轮询；不加载模型、不访问 GPU。
@@ -131,27 +133,184 @@ class TaskFlow(unittest.TestCase):
         self.assertEqual([call.args[0] for call in command.call_args_list],
                          [['docker','stop','--time','15',cid],['docker','rm','--force',cid]])
 
-    def test_model_partial_download_and_cache_reuse(self):
-        destination=self.root/'model'
-        destination.mkdir()
-        (destination/'config.json').write_text('{}')
-        revision='b'*40
-        calls=[]
+    def test_preparation_uses_returned_model_path_for_server_and_driver(self):
+        for local in (None, self.root/'custom-model'):
+            job = self.job('prepare-local' if local else 'prepare-default')
+            job.model = local
+            job.root.mkdir(parents=True)
+            job.snapshot()
+            actual = local or self.root/('hub/models--org--model/snapshots/'+'b'*40)
+            def command(argv, **_):
+                if '--output' in argv:
+                    output = Path(argv[argv.index('--output')+1])
+                    output.write_text(json.dumps({'path': str(actual if argv[2]=='model' else self.root/'source')}))
+            with patch.object(job, 'command', side_effect=command) as commands:
+                Job.prepare(job)
+            self.assertEqual(job.model, actual)
+            self.assertEqual(job.env['MODEL_DIR'], str(actual))
+            model_args = commands.call_args.args[0]
+            self.assertEqual('--directory' in model_args, local is not None)
+            self.assertEqual(model_args[2], 'model')
+            job.args.runtime = 'docker'
+            with patch.object(job, 'container_id', return_value='a'*64):
+                driver = Job.driver_command(job)
+            self.assertEqual(driver[driver.index('--tokenizer')+1], docker_model_mount(actual)[1])
+
+
+class ModelPreparation(unittest.TestCase):
+    revision = 'b'*40
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='hicache-model-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    @staticmethod
+    def write_model(directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        files = {'config.json': b'{}', 'tokenizer.json': b'{}',
+                 'model.safetensors.index.json': json.dumps({'weight_map': {'x': 'part1.safetensors', 'y': 'part2.safetensors'}}).encode()}
+        for name, part in (('x', 'part1.safetensors'), ('y', 'part2.safetensors')):
+            header = json.dumps({name: {'dtype': 'F32', 'shape': [1], 'data_offsets': [0, 4]}}).encode()
+            files[part] = struct.pack('<Q', len(header)) + header + b'1234'
+        for name, data in files.items():
+            if not (directory/name).is_file():
+                (directory/name).write_bytes(data)
+
+    def snapshot(self, cache):
+        repository = cache/'models--org--model'
+        snapshot = repository/'snapshots'/self.revision
+        blobs = repository/'blobs'
+        self.write_model(blobs)
+        snapshot.mkdir(parents=True)
+        for file in blobs.iterdir():
+            (snapshot/file.name).symlink_to('../../blobs/' + file.name)
+        return snapshot
+
+    def test_only_explicit_model_directory_is_resolved_before_preparation(self):
+        args = argparse.Namespace(experiment='qwen35-35b-matrix', runtime='native', run_id='paths')
+        job = Job(args, environ={'MODEL_ROOT': '/unused'})
+        self.assertIsNone(job.model)
+        self.assertNotIn('model-path', job.resolution['server'])
+        self.assertNotIn('MODEL_DIR', job.env)
+        self.assertEqual(Job(args, environ={'MODEL_DIR': '/from-env'}).model, Path('/from-env'))
+        args.model_dir = '/from-cli'
+        self.assertEqual(Job(args, environ={'MODEL_DIR': '/from-env'}).model, Path('/from-cli'))
+
+    def test_complete_directory_is_reused_without_downloading_or_writing(self):
+        directory = self.root/'local'
+        self.write_model(directory)
+        before = {p.name: p.stat().st_mtime_ns for p in directory.iterdir()}
+        with patch('huggingface_hub.snapshot_download') as download:
+            info = prepare_model('org/model', self.revision, directory)
+        download.assert_not_called()
+        self.assertFalse(info['download_requested'])
+        self.assertEqual(info['path'], str(directory))
+        self.assertEqual(before, {p.name: p.stat().st_mtime_ns for p in directory.iterdir()})
+
+    def test_dry_run_does_not_prepare_model_cache_or_results(self):
+        env = {k: v for k, v in os.environ.items() if k not in ('MODEL_DIR', 'MODEL_ROOT')}
+        env.update(HF_HOME=str(self.root/'hf'), HICACHE_CACHE_DIR=str(self.root/'source-cache'),
+                   RESULTS_DIR=str(self.root/'results'))
+        result = subprocess.run([sys.executable, str(PROJECT/'run_all.py'), 'qwen35-122b-128k', '--dry-run'],
+                                env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        preview = json.loads(result.stdout)
+        self.assertIsNone(preview['model_directory'])
+        self.assertEqual(preview['model_location'], 'huggingface-default-cache')
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_missing_directory_interruption_and_missing_shard_are_completed(self):
+        directory = self.root/'new'
+        calls = []
         def download(**kwargs):
             calls.append(kwargs)
-            (destination/'tokenizer.json').write_text('{}')
-            (destination/'model.safetensors.index.json').write_text(json.dumps({'weight_map':{'x':'part.safetensors'}}))
-            if len(calls)==1: raise OSError('interrupted download')
-            (destination/'part.safetensors').write_bytes(b'fixture')
-        with contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(OSError): prepare_model(destination,'org/model',revision,download)
-            self.assertFalse((destination/'.hicache-model.json').exists())
-            self.assertFalse(prepare_model(destination,'org/model',revision,download)['reused'])
-            self.assertTrue(prepare_model(destination,'org/model',revision,download)['reused'])
-            self.assertEqual(len(calls),2)
-            (destination/'part.safetensors').unlink()
-            self.assertFalse(prepare_model(destination,'org/model',revision,download)['reused'])
-            self.assertTrue(calls[-1]['force_download'])
+            self.write_model(directory)
+            if len(calls)==1:
+                (directory/'part2.safetensors').unlink()
+                raise OSError('interrupted')
+            return str(directory)
+        with self.assertRaises(OSError):
+            prepare_model('org/model', self.revision, directory, download)
+        weight = directory/'part1.safetensors'
+        unchanged = weight.stat().st_mtime_ns
+        info = prepare_model('org/model', self.revision, directory, download)
+        self.assertTrue(info['download_requested'])
+        self.assertEqual(calls[-1]['local_dir'], str(directory))
+        self.assertIn('part1.safetensors', calls[-1]['ignore_patterns'])
+        self.assertNotIn('part2.safetensors', calls[-1]['ignore_patterns'])
+        self.assertEqual(weight.stat().st_mtime_ns, unchanged)
+        self.assertFalse(prepare_model('org/model', self.revision, directory, download)['download_requested'])
+        self.assertEqual(len(calls), 2)
+        self.assertFalse((directory/'.hicache-model.json').exists())
+        self.assertFalse((directory.parent/(directory.name+'.lock')).exists())
+
+    def test_corrupt_files_and_recorded_revision_conflicts_are_not_overwritten(self):
+        directory = self.root/'local'
+        self.write_model(directory)
+        part = directory/'part1.safetensors'
+        original = part.read_bytes()
+        part.write_bytes(b'broken')
+        with patch('huggingface_hub.snapshot_download') as download:
+            with self.assertRaises(ValueError): prepare_model('org/model', self.revision, directory)
+            download.assert_not_called()
+        part.write_bytes(original)
+        evidence = [directory/'.hicache-model.json', directory/'.cache/huggingface/download/config.json.metadata']
+        for marker in evidence:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({'repo': 'org/other', 'revision': 'c'*40}) if marker.suffix=='.json' else 'c'*40+'\n')
+            with patch('huggingface_hub.snapshot_download') as download:
+                with self.assertRaises(ValueError): prepare_model('org/model', self.revision, directory)
+                download.assert_not_called()
+            marker.unlink()
+
+    def test_default_download_uses_only_hf_arguments_and_returned_path(self):
+        snapshot = self.snapshot(self.root/'arbitrary-hf-cache')
+        with patch('huggingface_hub.snapshot_download', return_value=str(snapshot)) as download:
+            info = prepare_model('org/model', self.revision)
+        download.assert_called_once_with(repo_id='org/model', revision=self.revision)
+        self.assertEqual(info['path'], str(snapshot))
+        self.assertEqual(info['revision'], self.revision)
+        self.assertEqual(info['source'], 'huggingface')
+        self.assertFalse((self.root/'arbitrary-hf-cache/.hicache').exists())
+        with patch('huggingface_hub.constants.HF_HUB_OFFLINE', True), \
+                patch('huggingface_hub.snapshot_download', return_value=str(snapshot)) as download:
+            prepare_model('org/model', self.revision)
+        download.assert_called_once_with(repo_id='org/model', revision=self.revision, local_files_only=True)
+
+    def test_explicit_hf_snapshot_repairs_in_hub_cache_and_keeps_symlinks(self):
+        cache = self.root/'hub'
+        snapshot = self.snapshot(cache)
+        blob = snapshot.parent.parent/'blobs/part2.safetensors'
+        blob.unlink()
+        def download(**kwargs):
+            self.assertEqual(kwargs, dict(repo_id='org/model', revision=self.revision, cache_dir=str(cache)))
+            self.write_model(blob.parent)
+            return str(snapshot)
+        info = prepare_model('org/model', self.revision, snapshot, download)
+        self.assertEqual(info['path'], str(snapshot))
+        self.assertTrue((snapshot/'part2.safetensors').is_symlink())
+        with self.assertRaises(ValueError): prepare_model('org/model', 'c'*40, snapshot)
+        local = self.root/'local'
+        local.mkdir()
+        for file in snapshot.iterdir():
+            (local/file.name).symlink_to(file.resolve())
+        with self.assertRaises(ValueError): inspect_model(local)
+
+    def test_real_hf_offline_cache_respects_standard_environment_variables(self):
+        base = self.root/'cache'
+        cache = base/'hub'
+        snapshot = self.snapshot(cache)
+        clean_env = {k: v for k, v in os.environ.items() if k not in ('HF_HOME', 'HF_HUB_CACHE', 'HUGGINGFACE_HUB_CACHE', 'XDG_CACHE_HOME')}
+        for override in ({'HF_HOME': str(base)}, {'HF_HUB_CACHE': str(cache), 'HF_HOME': str(self.root/'other')}):
+            with self.subTest(override=override):
+                output = self.root/'model.json'
+                result = subprocess.run([sys.executable, str(PROJECT/'prepare_runtime.py'), 'model',
+                                         '--repo', 'org/model', '--revision', self.revision, '--output', str(output)],
+                                        env={**clean_env, **override, 'HF_HUB_OFFLINE': '1'},
+                                        capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(output.read_text())['path'], str(snapshot))
 
 
 if __name__=='__main__': unittest.main()

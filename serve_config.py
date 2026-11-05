@@ -9,6 +9,8 @@ import re
 import shlex
 import sys
 
+from prepare_runtime import docker_model_mount
+
 CONFIG_DIR = Path(__file__).resolve().parent / "configs/serve"
 # 兼容原来的显式环境变量；没有设置的变量不产生默认值，不覆盖 YAML。
 ENV_OPTIONS = {
@@ -74,7 +76,7 @@ def read_profile(name, directory):
     return path, raw, data
 
 
-def resolve(name, runtime, argv, environ=None, directory=CONFIG_DIR):
+def resolve(name, runtime, argv, environ=None, directory=CONFIG_DIR, resolve_model=True):
     """优先级：CLI > 显式环境变量 > 文件；模型 CLI 覆盖需先处理挂载路径。"""
     environ = os.environ if environ is None else environ
     path, raw, data = read_profile(name, directory)
@@ -105,13 +107,15 @@ def resolve(name, runtime, argv, environ=None, directory=CONFIG_DIR):
         else:
             cli.append(arg)
         index += 1
-    model_dir = model_override or environ.get("MODEL_DIR")
-    if not model_dir:
-        if not environ.get("MODEL_ROOT"):
-            raise ValueError("请设置 MODEL_ROOT；也可用 MODEL_DIR 或 --model-path 指定完整模型目录")
-        model_dir = str(Path(environ["MODEL_ROOT"]).expanduser() / data["model"])
-    model_dir = str(Path(model_dir).expanduser().resolve())
-    server["model-path"] = "/model" if runtime == "docker" else model_dir
+    model_dir = None
+    if resolve_model:
+        model_dir = model_override or environ.get("MODEL_DIR")
+        if not model_dir:
+            if not environ.get("MODEL_ROOT"):
+                raise ValueError("请设置 MODEL_ROOT；也可用 MODEL_DIR 或 --model-path 指定完整模型目录")
+            model_dir = str(Path(environ["MODEL_ROOT"]).expanduser() / data["model"])
+        model_dir = str(Path(model_dir).expanduser().resolve())
+        server["model-path"] = docker_model_mount(model_dir)[1] if runtime == "docker" else model_dir
 
     environment = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
     for key, value in data.get("env", {}).items():
@@ -136,7 +140,7 @@ def resolve(name, runtime, argv, environ=None, directory=CONFIG_DIR):
         raise ValueError("GPU 计时需要开启 HiCache；关闭 HiCache 时也请设置 FORWARD_TIMING=0")
     if enabled:
         environment.setdefault("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", "python")
-    if any("\0" in value for value in [model_dir, *environment.values(), *cli]):
+    if any("\0" in value for value in [model_dir or "", *environment.values(), *cli]):
         raise ValueError("路径、参数和环境变量不能包含 NUL 字符")
     yaml = yaml_module()
     return dict(
@@ -173,6 +177,8 @@ def main():
     p.add_argument("args", nargs=argparse.REMAINDER)
     sub.add_parser("unpack")
     sub.add_parser("preview")
+    p = sub.add_parser("model-mount")
+    p.add_argument("directory")
     args = parser.parse_args()
     if args.action == "list":
         print("\n".join(path.stem for path in sorted(CONFIG_DIR.glob("*.yaml"))))
@@ -181,6 +187,8 @@ def main():
         print(json.dumps(resolve(args.name, args.runtime, argv), ensure_ascii=False))
     elif args.action == "unpack":
         unpack(json.load(sys.stdin))
+    elif args.action == "model-mount":
+        sys.stdout.buffer.write(b"".join(value.encode() + b"\0" for value in docker_model_mount(args.directory)))
     else:
         preview(json.load(sys.stdin))
 

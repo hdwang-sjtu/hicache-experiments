@@ -143,7 +143,7 @@ class RankEvidence(unittest.TestCase):
         job = Job(args, environ={})
         server = job.resolution['server']
         self.assertEqual((server['context-length'], server['chunked-prefill-size']), (135168, 32768))
-        self.assertTrue(job.local_model)
+        self.assertEqual(str(job.model), '/readonly/model')
         for changed in (dict(ep=2), dict(context_length=8192), dict(chunked_prefill_size=1024)):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 Job(argparse.Namespace(**(vars(args) | changed)), environ={})
@@ -187,7 +187,7 @@ class LocalModel(unittest.TestCase):
             part.write_bytes(struct.pack('<Q', len(header)) + header + b'12')
             with self.assertRaises(ValueError): inspect_model(root)
             part.unlink()
-            with self.assertRaises(ValueError): inspect_model(root)
+            with self.assertRaises(FileNotFoundError): inspect_model(root)
 
 
 if __name__ == '__main__': unittest.main()

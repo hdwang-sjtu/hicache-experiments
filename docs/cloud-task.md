@@ -55,23 +55,47 @@ test:
 它不修改你已有的 SGLang checkout。缓存中的源码如果被改动会报错，不会自动重置用户文件或重复打补丁。
 当前补丁来源由版本锁记录，提供 FULL/FULL+MAMBA 的备份检查、多 rank 协同驱逐和稳定状态检查，不修改模型计算。
 
-模型使用 Hugging Face 固定 commit 下载，缺少分片或中断下载时会补齐。
-完成后保存版本与文件清单；后续只有同仓库、同版本且文件完整的缓存才直接复用。仅有 `config.json` 不算完整模型。
-已完成缓存发生文件变化时重新校验/下载，不把旧完成标记当成有效证据。
+模型仓库和固定版本由实验配置决定，模型目录只保留两条规则：
+
+- 指定 `--model-dir` / `MODEL_DIR`：命令行优先；检查指定目录，完整就直接用，目录不存在或缺文件时从 HF 补齐，再检查。
+- 不指定：调用 `snapshot_download(repo_id=..., revision=...)`，由 HF 库处理默认缓存和文件复用，直接使用其返回的完整模型路径。
+
+检查配置、tokenizer、分片索引和 safetensors 头部，不计算全部权重哈希。补齐只下载缺失文件，保留已有文件；结构损坏或已有来源记录明确指向其他模型/版本时，报错说明原因。
+下载中断后可重新执行，HF 负责复用下载产物；HF 离线模式保持生效，缺文件且无法下载时任务失败。
+本轮 `model.json` 记录实际路径、文件清单和版本线索，不新增项目专用的模型完成标记。`download_requested` 表示是否调用了下载器，不代表实际重新传输了权重。
 
 默认布局：
 
 ```text
-.cache/
+<项目目录>/.cache/               # 源码缓存，与 HF 模型缓存独立
 ├── sglang/<基线>-<补丁哈希>/checkout/
-├── models/<服务配置的模型目录名>/<模型revision>/
 └── locks/
+
+~/.cache/huggingface/hub/        # 默认模型缓存，遵循 HF_HOME / HF_HUB_CACHE
+└── models--Qwen--<模型名>/
+    ├── blobs/
+    └── snapshots/<模型revision>/
 ```
 
-可设置 `HICACHE_CACHE_DIR` 修改缓存根目录，`MODEL_ROOT` 单独修改版本化模型缓存根目录。
-`--model-dir` 或 `MODEL_DIR` 可只读使用现有本地模型，检查分片索引和 safetensors 头部，不做全权重哈希，也不写入完成标记。
-固定 revision 缓存和手工模型分别记录来源。`--source-repository` 可指定含固定基线的本地 Git 仓库作为离线源码来源，补丁校验仍执行。
+默认无需设置模型目录；HF 库自行处理 `HF_HOME` / `HF_HUB_CACHE` 等标准设置，项目不手工解析这些环境变量或拼接快照目录。
+可设置 `HICACHE_CACHE_DIR` 单独修改源码缓存根目录，它不影响默认模型缓存。
+`run_all.py` 不再使用 `MODEL_ROOT`；独立启动脚本的手工模型路径选项不受影响，也不负责下载。
+显式指定已有 HF 快照时，缺文件通过对应的 Hub 缓存补齐，保留快照的软链接布局。
+本地 metadata 或快照目录名只作为版本线索，不冒充完整内容验证。`--source-repository` 可指定含固定基线的本地 Git 仓库作为离线源码来源，补丁校验仍执行。
 下载阶段与推理计时完全分开。认证由环境中的 Hugging Face 凭据提供，不写入实验 YAML 或任务状态。
+
+已有 SGLang 容器中使用 `--runtime native` 时，可沿用官方示例挂载：
+
+```text
+# 宿主机目录挂到容器的 HF 根目录（以容器中 root 用户的默认路径为例）。
+-v "$HF_CACHE_DIR:/root/.cache/huggingface"
+```
+
+此处 `HF_CACHE_DIR` 是 Docker 命令自定义的宿主机变量，HF 库不会读取它；容器内模型缓存为 `/root/.cache/huggingface/hub`。
+挂载的是 HF 根目录，不要把宿主机的 `hub/` 子目录再挂到这个根目录。
+如果挂载到其他位置，如 `/workspace/huggingface`，在容器里设置 `HF_HOME=/workspace/huggingface` 即可，无需设置 `MODEL_ROOT`。
+宿主机使用 `run_all.py --runtime docker` 时，总控在宿主机准备模型，并自动只读挂载模型仓库的 snapshots 和 blobs；Driver 和服务使用同一个快照路径。
+HF 缓存布局与环境变量见 [HF 官方说明](https://huggingface.co/docs/huggingface_hub/guides/manage-cache)。
 
 Docker 模式默认使用版本锁中的镜像，允许 `--image` 覆盖，并记录其本地镜像 ID。native 模式只记录“期望镜像”和真实软件环境，不能从容器内部假装已验证镜像摘要。
 脚本不安装或升级 Torch/CUDA；依赖不匹配、GPU 不可用等问题会作为启动失败留下日志。
@@ -116,7 +140,7 @@ results/<run-id>/
 
 ```bash
 cd /workspace/hicache-experiments
-export HICACHE_CACHE_DIR=/workspace/cache
+export HF_HOME=/workspace/huggingface
 export RESULTS_DIR=/workspace/results
 exec python3 run_all.py qwen3-8b-smoke --run-id smoke-001
 ```

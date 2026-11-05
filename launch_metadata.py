@@ -72,7 +72,7 @@ def record(args):
     snapshot = directory / "launch-source"
     snapshot.mkdir()
     metadata["launcher_sha256"] = {}
-    for name in ("serve.sh", "launch_server.sh", "launch_metadata.py", "serve_config.py"):
+    for name in ("serve.sh", "launch_server.sh", "launch_metadata.py", "serve_config.py", "prepare_runtime.py"):
         path = Path(__file__).with_name(name)
         shutil.copyfile(path, snapshot / name)
         metadata["launcher_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()

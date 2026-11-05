@@ -138,6 +138,31 @@ elif command[0] == 'wait': print('17')
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(calls[-2:], [["stop", "--time", "15", "owned-container-id"], ["rm", "owned-container-id"]])
 
+    def test_docker_hf_snapshot_keeps_blobs_and_config_paths(self):
+        revision = 'd'*40
+        repository = self.root/'hub/models--org--model'
+        snapshot = repository/'snapshots'/revision
+        blobs = repository/'blobs'
+        snapshot.mkdir(parents=True)
+        blobs.mkdir()
+        (blobs/'config').write_text('{}')
+        (snapshot/'config.json').symlink_to('../../blobs/config')
+        for profile in (None, 'qwen3-8b-4k'):
+            with self.subTest(profile=profile):
+                run_id = 'hf-named' if profile else 'hf-generic'
+                self.fake_docker()
+                log = self.root/(run_id + '.jsonl')
+                result = self.run_script('launch_server.sh', *([profile] if profile else []),
+                                         MODEL_DIR=str(snapshot), RUN_ID=run_id, FAKE_DOCKER_LOG=str(log))
+                self.assertEqual(result.returncode, 17, result.stderr)
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                command = next(call for call in calls if call[0] == 'run')
+                self.assertIn(f'type=bind,src={repository},dst=/model,readonly', command)
+                self.assertIn(f'MODEL_DIR=/model/snapshots/{revision}', command)
+                if profile:
+                    resolution = json.loads((self.root/f'results/{run_id}/profile-resolution.json').read_text())
+                    self.assertEqual(resolution['server']['model-path'], f'/model/snapshots/{revision}')
+
 
 class RemoteClient(unittest.TestCase):
     def setUp(self):

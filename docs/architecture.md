@@ -61,7 +61,7 @@
 
 命名模式下，两种入口都使用 `serve_config.py`，遵循 **命令行 > 显式环境变量 > 配置文件**。
 native 由 `serve.sh` 解析配置，再调用 `launch_metadata.py` 写记录，最后执行 SGLang。
-Docker 由宿主机上的 `launch_server.sh` 解析模型路径并将容器路径改为 `/model`，调用同一记录工具保存配置，再将冻结的 `profile-resolution.json` 交给容器内的 `serve.sh --exec --resolved-profile`。
+Docker 由宿主机上的 `launch_server.sh` 解析模型路径并将容器路径改为 `/model`（HF 快照为 `/model/snapshots/<revision>/`），调用同一记录工具保存配置，再将冻结的 `profile-resolution.json` 交给容器内的 `serve.sh --exec --resolved-profile`。
 容器内仅解包已解析配置，不重新读取原始 YAML，也不重复生成启动记录。
 
 命名启动保存的 `profile.yaml` 是原文，`server-config.yaml` 是环境覆盖后的下发配置，`profile-resolution.json` 保存路径、环境和 CLI 信息；CLI 仍可覆盖下发 YAML。
@@ -79,8 +79,10 @@ Docker 包装只转交显式变量和追加参数，并调用 `serve.sh --exec`�
 - **服务配置**决定怎样提供推理服务：上下文、KV 容量、精度、HiCache 和计时等；它的顶层 `model` 是本地目录名，不等于模型仓库或模型版本。
 - **版本锁与补丁**决定总控准备的运行代码：`sglang_base` 是实际 checkout 的 HEAD，工作区再应用锁定哈希的补丁；`patch_source_commit` 记录补丁来源，并不是准备时检出的 HEAD。官方镜像本身不会自动包含本地实验补丁。
 
-显式 `--model-dir`/`MODEL_DIR` 时总控只读检查现有模型；否则总控将固定模型放入 `<MODEL_ROOT>/<服务配置的 model>/<revision>/`，并将准备好的源码缓存路径传给 `SGLANG_DIR`。
-源码缓存复用前检查基线与实际差异；模型缓存通过版本标记和文件清单检查完整性，缺失或变化时补齐/重新下载。详细规则见 [固定版本与缓存](cloud-task.md#固定版本与缓存)。
+显式 `--model-dir`/`MODEL_DIR` 时总控检查指定目录，完整就直接使用，缺文件则按实验配置的仓库和版本补齐。
+不指定目录时，由 HF 库下载/复用默认缓存并返回实际模型路径；总控取得路径后才向启动器传入 `MODEL_DIR`。准备前的服务配置解析不要求模型路径，`--dry-run` 的 `model_directory` 为 `null` 表示由 HF 自动选择。
+总控不再使用 `MODEL_ROOT`；独立启动脚本仍保留原来的手工路径选项。准备好的源码缓存路径通过 `SGLANG_DIR` 传给启动器。
+源码缓存复用前检查基线与实际差异；模型检查配置、索引和 safetensors 头部，模型准备只有一个函数，不新增缓存完成标记。详细规则见 [固定版本与缓存](cloud-task.md#固定版本与缓存)。
 
 版本锁由总控使用，独立启动脚本不会自动读取它或应用补丁。
 手工部署时，未设置 `SGLANG_DIR` 会优先使用存在的相邻 `../sglang`，也可显式指定 checkout；`SGLANG_DIR=''` 使用当前环境或镜像中的安装包。
@@ -114,8 +116,8 @@ Driver 不直接调用服务端 Python 对象，也不要求共享磁盘：`--to
 | 总控的 `server/`；独立启动的 `RESULTS_DIR/RUN_ID` | `launch.json`、配置解析记录、`launch-source/`、源码差异、GPU 信息和服务日志；Docker 另保存 `container.id`。 |
 | 总控的 `samples/`；独立 Driver 的 `--output-dir` | 输入、原始响应、样本 CSV、汇总、图表及 Driver 快照；可关联启动记录。字段与统计规则见 [运行与指标参考](usage.md)。 |
 | `.cache/sglang/<基线>-<补丁哈希>/checkout/` | 总控校验后复用的源码，避免修改手工准备的 checkout。 |
-| `.cache/models/<model>/<revision>/` | 默认版本化模型目录；`HICACHE_CACHE_DIR` 可改缓存根目录，`MODEL_ROOT` 可单独改模型根目录。 |
-| `.cache/locks/` 及源码/模型缓存旁的锁文件 | 限制同一端口的任务和同一缓存的并发准备。 |
+| `~/.cache/huggingface/hub/models--<组织>--<模型名>/snapshots/<revision>/` | 默认 HF 模型缓存，沿用 `HF_HOME` / `HF_HUB_CACHE`；快照引用同仓库 `blobs/`，Docker 挂载两者所在的仓库目录。 |
+| `.cache/locks/` 及源码缓存旁的锁文件 | 限制同一端口的任务和同一源码缓存的并发准备；模型下载的文件锁由 HF 库负责。 |
 
 `RESULTS_DIR` 可修改结果根目录。总控和启动器拒绝复用已有运行目录，Driver 拒绝覆盖已有测量；重新执行使用新目录，准备缓存可复用。
 [.gitattributes](../.gitattributes) 为补丁设置 whitespace 例外，以保留统一 diff 的上下文空行字节；修改补丁内容后须同步版本锁中的哈希。

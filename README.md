@@ -45,7 +45,9 @@ python3 run_all.py qwen3-8b-smoke --run-id smoke-001
 只有 Docker 环境时使用 `GPU=0 python3 run_all.py qwen3-8b-smoke --runtime docker`。
 任务自动准备固定版本的 SGLang 源码并应用仓库内补丁，下载/复用固定版本模型，完成 P=2K/S=128 的三组各 3 次测量，再停止本次服务。
 结果保存在 `results/<run-id>/`，用 `run.json` 查看状态和失败阶段；原始数据、CSV 和图表位于 `samples/`。
-默认缓存放 `.cache/`，可通过 `HICACHE_CACHE_DIR`、`MODEL_ROOT`、`RESULTS_DIR` 指向持久目录。
+模型只需两种用法：指定 `--model-dir` / `MODEL_DIR` 就检查该目录、缺文件自动补齐；不指定就使用 HF 库返回的默认缓存路径，通常位于 `~/.cache/huggingface/hub`。
+总控不再使用 `MODEL_ROOT`。HF 缓存位置沿用 `HF_HOME` / `HF_HUB_CACHE`，由 HF 库处理。
+源码缓存默认放项目 `.cache/`（可用 `HICACHE_CACHE_DIR` 修改），结果目录可用 `RESULTS_DIR` 指向持久卷。
 部署前需已有对应 GPU 驱动及推理依赖；脚本不管理云实例计费。详见 [一键云任务](docs/cloud-task.md)。
 
 ## 1. 启动服务：二选一
@@ -53,18 +55,18 @@ python3 run_all.py qwen3-8b-smoke --run-id smoke-001
 先准备完整模型目录。L2 和 GPU 计时需要带本地实验补丁的 SGLang；官方镜像本身不包含该补丁。
 使用当前仓库的相邻 `../sglang` 时会自动加载该源码，也可显式设置 `SGLANG_DIR`。
 
-每台机器先设置模型根目录，命名配置只需要轻量 YAML 依赖：
+手工启动服务时设置完整模型目录，命名配置只需要轻量 YAML 依赖：
 
 ```bash
 python3 -m pip install -r requirements-launch.txt
-export MODEL_ROOT=/workspace/models
+export MODEL_DIR=/workspace/models/Qwen3-8B
 bash serve.sh --list-configs
 ```
 
 已有环境（包括 Vast 普通容器）直接启动；需要 Docker 时使用另一个入口，二选一：
 
 ```bash
-# 当前环境，模型目录自动解析为 $MODEL_ROOT/Qwen3-8B。
+# 当前环境，直接使用 MODEL_DIR 中准备好的模型。
 RUN_ID=server-demo bash serve.sh qwen3-8b-4k
 
 # Docker：镜像须提前下载，宿主机需有 NVIDIA runtime。

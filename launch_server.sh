@@ -61,17 +61,20 @@ fi
 [[ "$MODEL_DIR" == /* ]] || MODEL_DIR="$PWD/$MODEL_DIR"
 [[ "$RESULTS_DIR" == /* ]] || RESULTS_DIR="$PWD/$RESULTS_DIR"
 if [[ -n "$SGLANG_DIR" && "$SGLANG_DIR" != /* ]]; then SGLANG_DIR="$PWD/$SGLANG_DIR"; fi
+# HF snapshots 中的相对软链接需要同仓库 blobs；普通模型目录仍直接挂载。
+mapfile -d '' -t model_mount < <(python3 "$SCRIPT_DIR/serve_config.py" model-mount "$MODEL_DIR")
+((${#model_mount[@]} == 2)) || exit 2
 # host 网络保留 loopback 控制接口语义；远程客户端通过 SSH 隧道访问。
 # 不把物理 GPU 编号再次传为容器 CUDA_VISIBLE_DEVICES，避免二次编号选择。
 docker_args=(docker run --detach --name "$CONTAINER_NAME" --pull never
     --cidfile "$RESULTS_DIR/$RUN_ID/container.id"
     --user "$(id -u):$(id -g)"
     --gpus "\"device=$GPU\"" --ipc=host --network=host
-    --mount "type=bind,src=$MODEL_DIR,dst=/model,readonly"
+    --mount "type=bind,src=${model_mount[0]},dst=/model,readonly"
     --mount "type=bind,src=$SCRIPT_DIR,dst=/experiment,readonly"
     --mount "type=bind,src=$RESULTS_DIR,dst=/results"
     --workdir /experiment --entrypoint /usr/bin/env
-    --env MODEL_DIR=/model --env "EXPERIMENT_LAUNCH_DIR=/results/$RUN_ID"
+    --env "MODEL_DIR=${model_mount[1]}" --env "EXPERIMENT_LAUNCH_DIR=/results/$RUN_ID"
     --env HOME=/tmp/hicache-home --env XDG_CACHE_HOME=/tmp/hicache-cache
     --env HF_HOME=/tmp/huggingface --env TRITON_CACHE_DIR=/tmp/triton
     --env TORCH_EXTENSIONS_DIR=/tmp/torch-extensions --env FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer

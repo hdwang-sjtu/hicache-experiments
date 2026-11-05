@@ -22,7 +22,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from prepare_runtime import cache_lock, write_json
+from prepare_runtime import cache_lock, docker_model_mount, write_json
 from rank_metrics import metric_delta
 import run_experiment as driver
 import serve_config
@@ -211,21 +211,15 @@ class Job:
         if hashlib.sha256(patch.read_bytes()).hexdigest() != self.lock["patch_sha256"]:
             raise ValueError("版本锁中的补丁哈希不匹配")
         self.cache = Path(self.env.get("HICACHE_CACHE_DIR", str(self.project / ".cache"))).expanduser().resolve()
-        model_root = Path(self.env.get("MODEL_ROOT", str(self.cache / "models"))).expanduser().resolve()
-        # 版本化目录避免覆盖手工准备的同名模型或将不同 revision 混在一起。
-        _, _, profile = serve_config.read_profile(self.experiment["serve"], self.project / "configs/serve")
         local = getattr(args, "model_dir", None) or self.env.get("MODEL_DIR")
-        self.local_model = bool(local)
-        self.model = (Path(local).expanduser().resolve() if local else
-                      model_root / profile["model"] / self.experiment["model"]["revision"])
-        self.env["MODEL_DIR"] = str(self.model)
+        self.model = Path(local).expanduser().resolve() if local else None
         for key, env_key in dict(tp="TP", ep="EP", context_length="CONTEXT_LENGTH",
                                 max_total_tokens="MAX_TOTAL_TOKENS", chunked_prefill_size="CHUNKED_PREFILL_SIZE",
                                 mem_fraction="MEM_FRACTION", hicache_size="HICACHE_SIZE", gpu="GPU", port="PORT").items():
             if getattr(args, key, None) is not None:
                 self.env[env_key] = str(getattr(args, key))
         self.resolution = serve_config.resolve(self.experiment["serve"], args.runtime, [], self.env,
-                                               self.project / "configs/serve")
+                                               self.project / "configs/serve", resolve_model=False)
         server = self.resolution["server"]
         hybrid = "mamba-radix-cache-strategy" in server
         if hybrid:
@@ -274,7 +268,7 @@ class Job:
         self.code = self.root / "code"
         self.python = self.env.get("PYTHON_BIN", sys.executable)
         self.identity = "hicache-job-" + uuid.uuid4().hex
-        self.env.update(RESULTS_DIR=str(self.root), RUN_ID="server", MODEL_DIR=str(self.model),
+        self.env.update(RESULTS_DIR=str(self.root), RUN_ID="server",
                         CONTAINER_NAME=self.identity, IMAGE=self.lock["image"], PYTHONUNBUFFERED="1",
                         GIT_TERMINAL_PROMPT="0", PYTHON_BIN=self.python)
         # 用绝对 Python 路径执行总控时，宿主机包装脚本也使用该解释器所在环境。
@@ -382,14 +376,16 @@ class Job:
         self.state["source"] = json.loads((self.root / "source.json").read_text())
         self.env["SGLANG_DIR"] = self.state["source"]["path"]
         self.phase("preparing_model")
-        model_command = [sys.executable, str(self.code / "prepare_runtime.py"),
-                         "inspect-model" if self.local_model else "model", "--directory", str(self.model),
+        model_command = [sys.executable, str(self.code / "prepare_runtime.py"), "model",
+                         "--repo", self.experiment["model"]["repo"],
+                         "--revision", self.experiment["model"]["revision"],
                          "--output", str(self.root / "model.json")]
-        if not self.local_model:
-            model_command += ["--repo", self.experiment["model"]["repo"],
-                              "--revision", self.experiment["model"]["revision"]]
+        if self.model is not None:
+            model_command += ["--directory", str(self.model)]
         self.command(model_command, timeout=7200)
         self.state["model"] = json.loads((self.root / "model.json").read_text())
+        self.model = Path(self.state["model"]["path"]).resolve()
+        self.env["MODEL_DIR"] = str(self.model)
 
     def wait_ready(self):
         deadline = time.monotonic() + self.test.ready_timeout
@@ -421,7 +417,7 @@ class Job:
                 raise RuntimeError("没有本次容器 ID")
             return ["docker", "exec", "--user", f"{os.getuid()}:{os.getgid()}", cid,
                     "python3", "/experiment/run_experiment.py", "run", "--base-url", self.url,
-                    "--tokenizer", "/model", "--output-dir", "/results/samples",
+                    "--tokenizer", docker_model_mount(self.model)[1], "--output-dir", "/results/samples",
                     "--server-artifacts", "/results/server", *self.test_argv]
         return [self.python, str(self.code / "run_experiment.py"), "run", "--base-url", self.url,
                 "--tokenizer", str(self.model), "--output-dir", str(self.root / "samples"),
@@ -550,7 +546,7 @@ def main():
     parser.add_argument("--run-id", help="本轮独立目录名，不能覆盖已有任务")
     parser.add_argument("--dry-run", action="store_true", help="只检查配置和显示任务，不联网、不启动、不写目录")
     parser.add_argument("--list-experiments", action="store_true")
-    parser.add_argument("--model-dir", help="只读使用现有本地模型，不下载或重写权重")
+    parser.add_argument("--model-dir", help="完整模型目录：检查并补齐；省略时使用 HF 默认缓存")
     parser.add_argument("--image", help="Docker 镜像覆盖；记录实际 image ID")
     parser.add_argument("--source-repository", help="固定基线的 Git 来源，可使用本地仓库离线准备")
     parser.add_argument("--gpu", help="GPU 编号列表，例如 0,1,2,3")
@@ -577,7 +573,9 @@ def main():
     if args.dry_run:
         print(json.dumps(dict(experiment=job.experiment, runtime=args.runtime, expected_image=job.lock["image"],
                               source_base=job.lock["sglang_base"], patch_sha256=job.lock["patch_sha256"],
-                              model_directory=str(job.model), result_directory=str(job.root),
+                              model_directory=str(job.model) if job.model is not None else None,
+                              model_location="specified" if job.model is not None else "huggingface-default-cache",
+                              result_directory=str(job.root),
                               server=job.resolution["server"], test_args=job.test_argv), ensure_ascii=False, indent=2))
         return 0
     return job.execute()

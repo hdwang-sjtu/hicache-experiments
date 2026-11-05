@@ -24,9 +24,10 @@ python3 run_all.py qwen35-35b-matrix --runtime docker \
   --tp 2 --ep 2 --gpu 0,1 --run-id qwen35-35b-tp2-001
 ```
 
-Docker 的 `/model` 和源码只读，`/results` 挂载到宿主机 `RESULTS_DIR/<run-id>`。容器使用宿主 UID/GID。GPU 列表指宿主机编号，容器内不重复设置同一组物理编号。
+Docker 的 `/model` 和源码只读，`/results` 挂载到宿主机 `RESULTS_DIR/<run-id>`。HF 快照挂载整个模型仓库，服务和 Driver 均使用 `/model/snapshots/<revision>/`，保留到 `blobs/` 的软链接。容器使用宿主 UID/GID。GPU 列表指宿主机编号，容器内不重复设置同一组物理编号。
 
-`--model-dir` 或 `MODEL_DIR` 指定现有模型时只检查配置、tokenizer、分片索引和 safetensors 头部范围，不改模型目录、不下载、不计算全部权重哈希。本地 HF metadata 仅作为 revision 线索，不冒充完整内容验证。省略本地路径则按实验 YAML 的固定 revision 下载到缓存。
+`--model-dir` 或 `MODEL_DIR` 指定完整模型目录：完整可用就直接使用，目录不存在或缺文件时按实验 YAML 的仓库和固定 revision 补齐。检查配置、tokenizer、分片索引和 safetensors 头部，不计算全部权重哈希；结构损坏或已有来源明确冲突时报错。本地 HF metadata 或快照目录名仅作为 revision 线索，不冒充完整内容验证。
+省略目录则交给 HF 库使用默认缓存，直接使用返回路径；通常位于 `~/.cache/huggingface/hub`，沿用 `HF_HOME` / `HF_HUB_CACHE`。总控不再使用 `MODEL_ROOT`。缓存和云平台挂载见 [一键任务](cloud-task.md#固定版本与缓存)。
 
 `--image` 可覆盖版本锁中的默认镜像，Docker 任务记录实际 image ID。镜像提供 Torch/CUDA 等运行依赖；SGLang Python 源码仍来自固定基线加仓库补丁，不能仅凭镜像内置版本判断实验代码。
 
