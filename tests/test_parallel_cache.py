@@ -12,9 +12,11 @@ import struct
 import threading
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError, URLError
 
 import rank_metrics as metrics
 from run_all import Job
+from run_experiment import Client
 
 PROJECT = Path(__file__).resolve().parents[1]
 
@@ -147,6 +149,64 @@ class RankEvidence(unittest.TestCase):
         for changed in (dict(ep=2), dict(context_length=8192), dict(chunked_prefill_size=1024)):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 Job(argparse.Namespace(**(vars(args) | changed)), environ={})
+
+
+class ClientArchive(unittest.TestCase):
+    def test_repeated_metrics_preserve_values_without_growing_archive(self):
+        labels = 'tp_rank="0",pp_rank="0",dp_rank="0",moe_ep_rank="0"'
+        lines = ['# ' + 'x' * 160_000]
+        for name, label, value in metrics.FORWARD:
+            lines.append(f'{name}{{{labels},{label}="{value}"}} 0')
+        for name in metrics.LOAD:
+            lines.append(f'{name}{{{labels}}} 0')
+        for pool in ('kv', 'mamba'):
+            lines.append(f'sglang:load_back_tokens_total{{{labels},pool="{pool}"}} 0')
+        text = '\n'.join(lines)
+        events = io.StringIO()
+        client = Client('http://localhost:39081', 1, events)
+        with patch('run_experiment.urllib.request.urlopen',
+                   side_effect=lambda *_args, **_kwargs: io.BytesIO(text.encode())):
+            for _ in range(32):
+                result, elapsed = client.request('/metrics', stage='metrics_before', parse_json=False)
+                self.assertEqual(result, text)
+                self.assertGreaterEqual(elapsed, 0)
+        self.assertEqual(events.getvalue(), '')
+        self.assertEqual(metrics.parse_metrics(result, 1, 1, True)[0]['seconds'], 0)
+
+        # 大量轮询之后，生成响应和缓存控制响应仍然保留原始内容与请求关联。
+        for path, payload, response in [
+            ('/generate', {'rid': 'measured-request'}, {'output_ids': [7]}),
+            ('/debug/hicache', {'action': 'inspect'}, {'success': True, 'ready': True}),
+        ]:
+            with patch('run_experiment.urllib.request.urlopen',
+                       return_value=io.BytesIO(json.dumps(response).encode())):
+                result, _ = client.request(path, payload, stage='measure')
+            record = json.loads(events.getvalue().splitlines()[-1])
+            self.assertEqual(record['path'], path)
+            self.assertEqual(record['request_id'], payload.get('rid'))
+            self.assertEqual(record['response'], result)
+            self.assertEqual(result, response)
+        self.assertEqual(len(events.getvalue().splitlines()), 2)
+
+    def test_metrics_failures_are_still_archived_and_fatal(self):
+        cases = [
+            (HTTPError('http://localhost:39081/metrics', 500, 'failure', {}, io.BytesIO(b'metrics failed')),
+             'metrics failed'),
+            (URLError('connection refused'), ''),
+            (TimeoutError('timed out'), ''),
+        ]
+        for error, body in cases:
+            with self.subTest(error=type(error).__name__):
+                events = io.StringIO()
+                client = Client('http://localhost:39081', 1, events)
+                with patch('run_experiment.urllib.request.urlopen', side_effect=error), \
+                     self.assertRaisesRegex(RuntimeError, 'metrics_after /metrics'):
+                    client.request('/metrics', stage='metrics_after', parse_json=False)
+                record = json.loads(events.getvalue())
+                self.assertEqual(record['path'], '/metrics')
+                self.assertEqual(record['stage'], 'metrics_after')
+                self.assertIn(str(error), record['error'])
+                self.assertEqual(record['error_body'], body)
 
 
 class GroupSelection(unittest.TestCase):

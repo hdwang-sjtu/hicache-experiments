@@ -274,7 +274,8 @@ Median 和 P95 仅对有效样本计算；P95 使用排序后线性插值。少�
 - 命名模式额外保存 `profile.yaml`、`server-config.yaml`、`profile-resolution.json`，记录原文、环境覆盖及 CLI；`launch.json` 保存配置名和哈希。
 - `config.json`：Driver 参数、状态、实际 `/server_info`、模型信息、客户端依赖版本、tokenizer 哈希。
 - `inputs.json`：固定文本、精确 prefix / suffix / 预热 suffix IDs 和测量输入哈希。
-- `responses.jsonl`：控制操作、预热和测量的原始响应，阶段分别标记。
+- `responses.jsonl`：控制操作、预热和测量的原始响应，阶段分别标记；成功的 `/metrics` 响应只在内存中解析，不逐次归档全文，查询失败仍记录错误。
+- `rank-metrics.jsonl`：GPU timing 任务保存各请求逐 rank 的指标起点、终点与差值，用于复核计时和缓存命中。
 - `samples.csv`：每个测量样本及有效性；`summary.csv`：有效样本 Median / P95 和无效计数。
 - `latency.png`：服务端首 token 延迟图（需要 matplotlib）；`source/` 保存 Driver 运行版本；`launch-source/` 保存可选的服务启动脚本快照。
 

@@ -322,7 +322,7 @@ def make_cases(tokenizer, prefixes, suffixes, text):
 
 
 class Client:
-    """串行 HTTP 客户端，同时把控制操作和原始响应写入 responses.jsonl。"""
+    """串行 HTTP 客户端；归档原始响应和错误，成功的 /metrics 全文仅在内存解析。"""
 
     def __init__(self, base_url, timeout, events):
         self.base_url, self.timeout, self.events = base_url.rstrip("/"), timeout, events
@@ -381,20 +381,22 @@ class Client:
             measurement_end_utc_ns=time.time_ns(),
         )
         result = json.loads(raw) if parse_json else raw.decode()
-        self.events.write(
-            json.dumps(
-                dict(
-                    stage=stage,
-                    path=path,
-                    request_id=(payload or {}).get("rid"),
-                    client_latency_ms=elapsed,
-                    **self.last_request_window,
-                    response=result,
-                ),
-                ensure_ascii=False,
-            ) + "\n"
-        )
-        self.events.flush()
+        # 轮询全文高度重复；必要的逐 rank 起点、终点和差值由 RankMetrics 归档。
+        if path != "/metrics":
+            self.events.write(
+                json.dumps(
+                    dict(
+                        stage=stage,
+                        path=path,
+                        request_id=(payload or {}).get("rid"),
+                        client_latency_ms=elapsed,
+                        **self.last_request_window,
+                        response=result,
+                    ),
+                    ensure_ascii=False,
+                ) + "\n"
+            )
+            self.events.flush()
         return result, elapsed
 
     def flush(self):
