@@ -25,6 +25,7 @@ import uuid
 from prepare_runtime import cache_lock, docker_model_mount, write_json
 from rank_metrics import metric_delta
 import run_experiment as driver
+from experiment_results import DRIVER_FILES
 import serve_config
 
 PROJECT = Path(__file__).resolve().parent
@@ -33,8 +34,8 @@ TEST_OPTIONS = {
     "prefix-lengths", "suffix-lengths", "groups", "output-length", "repeats", "max-attempts",
     "warmup-rounds", "seed", "timeout", "ready-timeout", "no-plot", "gpu-timing", "note", "text-file",
 }
-CODE_FILES = ("run_all.py", "prepare_runtime.py", "run_experiment.py", "serve_config.py",
-              "launch_metadata.py", "serve.sh", "launch_server.sh", "rank_metrics.py")
+CODE_FILES = (*DRIVER_FILES, "run_all.py", "prepare_runtime.py", "serve_config.py",
+              "launch_metadata.py", "serve.sh", "launch_server.sh")
 
 
 def named(name):
@@ -65,13 +66,12 @@ def load_experiment(name, project=PROJECT):
 
 def test_arguments(settings):
     """复用 Driver 的 argparse 类型；不复制它的长度解析和默认值。"""
-    parser = driver.build_parser()
-    run_parser = parser._subparsers._group_actions[0].choices["run"]
+    parser, actions = driver.build_run_parser()
     argv = []
     for key, value in settings.items():
         option = "--" + key
-        action = run_parser._option_string_actions[option]
-        if isinstance(action, argparse._StoreTrueAction):
+        action = actions[key]
+        if action.nargs == 0:
             if type(value) is not bool:
                 raise ValueError(f"{key} 必须是 true/false")
             if value:
@@ -85,7 +85,7 @@ def test_arguments(settings):
                 raise ValueError(f"{key} 必须是标量")
             argv.extend([option, str(value)])
     try:
-        args = parser.parse_args(["run", "--tokenizer", "/placeholder", "--output-dir", "/placeholder", *argv])
+        args = parser.parse_args(["--tokenizer", "/placeholder", "--output-dir", "/placeholder", *argv])
         driver.normalize_run_args(parser, args)
     except SystemExit as exc:
         raise ValueError("实验配置中的 Driver 参数无效") from exc
@@ -190,7 +190,12 @@ class MemoryMonitor:
 
 
 class Job:
-    """只编排本次拥有的子进程/容器；不连接已有服务或调用云平台管理 API。"""
+    """一轮实验的资源所有者：解析 → 冻结 → 准备 → 启动 → 测量 → 清理。
+
+    初始化只做参数检查，不下载、不创建结果目录。execute 才产生副作用；
+    无论在哪一步失败，都保留当前记录并清理本轮拥有的进程/容器。
+    服务内的实际缓存容量与命中由 Driver 再验收，不能用配置值代替实测。
+    """
 
     def __init__(self, args, project=PROJECT, environ=None):
         self.project = Path(project)
@@ -290,21 +295,13 @@ class Job:
         print(f"[{name}] {self.root}", flush=True)
 
     def snapshot(self):
+        """执行冻结副本，保证长实验期间编辑工作区不会混入本轮结果。"""
         self.code.mkdir()
         self.state["code_sha256"] = {}
         for name in CODE_FILES:
             content = (self.project / name).read_bytes()
             (self.code / name).write_bytes(content)
             self.state["code_sha256"][name] = hashlib.sha256(content).hexdigest()
-        profiles = self.code / "configs/serve"
-        profiles.mkdir(parents=True)
-        # Freeze resolved values, including CLI overrides and adaptive capacity.
-        frozen = dict(self.resolution["server"])
-        frozen.pop("model-path", None)
-        _, _, profile = serve_config.read_profile(self.experiment["serve"], self.project / "configs/serve")
-        profile.update(sglang=frozen, env=self.resolution["environment"])
-        (profiles / (self.experiment["serve"] + ".yaml")).write_text(
-            serve_config.yaml_module().safe_dump(profile, allow_unicode=True, sort_keys=False))
         (self.root / "serve-original.yaml").write_text(self.resolution["source_text"])
         write_json(self.root / "resolved-experiment.json", self.experiment)
         (self.root / "experiment.yaml").write_bytes(self.experiment_path.read_bytes())
@@ -354,6 +351,7 @@ class Job:
         self.wait(self.start(argv, log), timeout)
 
     def prepare(self):
+        """准备独立于测量计时；最终模型路径以 HF/本地检查的返回值为准。"""
         if self.args.runtime == "docker":
             self.phase("preparing_image")
             if subprocess.run(["docker", "image", "inspect", self.lock["image"]], stdout=subprocess.DEVNULL,
@@ -455,9 +453,6 @@ class Job:
                 errors.append(str(exc))
         for thread in self.threads:
             thread.join(timeout=5)
-        # Driver 可能在服务停止前复制过日志，最后再保存完整版本。
-        if (self.root / "samples").is_dir() and (self.root / "server/server.log").is_file():
-            shutil.copyfile(self.root / "server/server.log", self.root / "samples/server.log")
         if errors:
             raise RuntimeError("; ".join(errors))
 
@@ -501,8 +496,18 @@ class Job:
             monitor = MemoryMonitor(self.root, self.state)
             monitor.thread.start()
             launcher = "serve.sh" if self.args.runtime == "native" else "launch_server.sh"
-            self.server = self.start(["bash", str(self.code / launcher), self.experiment["serve"],
-                                      "--served-model-name", self.identity], "server-launch.log")
+            # CLI/环境/YAML 已在初始化时合并；模型下载后补入实际路径。
+            # 启动器只执行这份最终配置，避免环境变量覆盖自适应容量等已校验值。
+            resolution = self.resolution
+            resolution["model_directory"] = str(self.model)
+            resolution["server"]["model-path"] = (
+                docker_model_mount(self.model)[1] if self.args.runtime == "docker" else str(self.model))
+            resolution["cli_args"] = ["--served-model-name", self.identity]
+            resolution["server_yaml"] = serve_config.yaml_module().safe_dump(resolution["server"], sort_keys=False)
+            frozen = self.root / "resolved-serve.json"
+            write_json(frozen, resolution)
+            self.server = self.start(["bash", str(self.code / launcher), "--resolved-profile", str(frozen)],
+                                     "server-launch.log")
             self.wait_ready()
             self.phase("testing")
             self.wait(self.start(self.driver_command(), "driver.log"), watch_server=True)

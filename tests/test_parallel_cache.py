@@ -81,6 +81,52 @@ class DistributedControl(unittest.TestCase):
 
 
 class RankEvidence(unittest.TestCase):
+    def test_delayed_rank_publication_and_h2d_only_use_same_reader(self):
+        """实际轮询/归档路径：慢 rank 未提交时继续等待，完整后稳定再返回。"""
+        for gpu_timing in (True, False):
+            with self.subTest(gpu_timing=gpu_timing), tempfile.TemporaryDirectory() as temp:
+                after = self.counters()
+                before = {r: dict.fromkeys(v, 0) for r, v in after.items()}
+                if not gpu_timing:
+                    keys = {'kv_tokens', 'load_seconds', 'load_ops', 'load_bytes', 'mamba_states'}
+                    before = {r: {k: v for k, v in row.items() if k in keys} for r, row in before.items()}
+                    after = {r: {k: v for k, v in row.items() if k in keys} for r, row in after.items()}
+
+                def prometheus(counters):
+                    lines = []
+                    for rank, row in counters.items():
+                        labels = f'tp_rank="{rank}",pp_rank="0",dp_rank="0",moe_ep_rank="{rank}"'
+                        for (name, label, value), key in metrics.FORWARD.items():
+                            if key in row:
+                                lines.append(f'{name}{{{labels},{label}="{value}"}} {row[key]}')
+                        for name, key in metrics.LOAD.items():
+                            lines.append(f'{name}{{{labels}}} {row[key]}')
+                        for pool, key in [('kv', 'kv_tokens'), ('mamba', 'mamba_states')]:
+                            lines.append(f'sglang:load_back_tokens_total{{{labels},pool="{pool}"}} {row[key]}')
+                    return '\n'.join(lines)
+
+                moments, polls = [0.0], []
+                def request(*_, **__):
+                    polls.append(moments[0])
+                    # 首次只有 rank 0 完成；即使 HTTP 已返回，也不能收为最终证据。
+                    value = {0: after[0], 1: before[1]} if len(polls) == 1 else after
+                    return prometheus(value), 1.0
+                client = Mock(timeout=2, request=request)
+                clock = Mock(monotonic=lambda: moments[0], sleep=lambda dt: moments.__setitem__(0, moments[0]+dt))
+                path = Path(temp) / 'ranks.jsonl'
+                reader = metrics.RankMetrics(client, dict(tp_size=2, ep_size=2, chunked_prefill_size=256),
+                                             True, path, gpu_timing=gpu_timing)
+                with patch.object(metrics, 'time', clock):
+                    result = reader.finish(before, 'measure', 'request-1',
+                                           p=256, s=128, group='l2', state=self.state())
+                self.assertGreaterEqual(polls[-1] - polls[1], .4)
+                self.assertEqual(result['kv_load_bytes'], 12288)
+                self.assertEqual(result['kv_load_tokens'], 256)
+                self.assertEqual('prefill_forward_gpu_ms' in result, gpu_timing)
+                records = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]['after']['1'], after[1])
+
     def state(self, tp=2):
         return {'ranks': {str(r): dict(device_tokens=0, host_hit_tokens=256, host_backed_tokens=256,
                                       backup_complete=True, cache_components=['full', 'mamba'],

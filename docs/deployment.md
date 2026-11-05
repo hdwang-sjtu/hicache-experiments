@@ -9,7 +9,7 @@
 SGLang 和模型放在工程外。默认自动使用相邻 `../sglang`；也可设置 `SGLANG_DIR=/path/to/sglang`。
 显式 `SGLANG_DIR=''` 表示使用 Python 环境/镜像已经安装的包。安装包仍需与实验接口、指标和启动参数兼容。
 CPU L2 及混合缓存多卡补丁由本仓库版本锁记录，官方上游镜像不会自动包含它。
-客户端需要 `run_experiment.py`、`rank_metrics.py` 和 tokenizer 文件；`--tokenizer` 永远是客户端路径，`--output-dir` 永远写在客户端。
+客户端需要 `run_experiment.py`、`rank_metrics.py`、`experiment_results.py`、`experiment_diagnostics.py` 和 tokenizer 文件；`--tokenizer` 永远是客户端路径，`--output-dir` 永远写在客户端。
 
 ## 命名服务配置
 
@@ -80,7 +80,7 @@ Docker 在宿主机解析并冻结配置，容器不再次解析原始文件。`
 ```bash
 MODEL_DIR=/workspace/models/Qwen3-8B SGLANG_DIR=/workspace/sglang \
   HICACHE=1 FORWARD_TIMING=1 RUN_ID=server-demo \
-  bash serve.sh
+  bash serve.sh qwen3-8b-4k
 ```
 
 不设置 `GPU` 时继承当前可见设备；云平台已经只分配一张卡时通常不需要再设置。
@@ -100,13 +100,13 @@ export IMAGE=lmsysorg/sglang@sha256:b4323a896f349d43a267c419c0267538b06c64a73110
 docker pull "$IMAGE"
 MODEL_DIR=/path/to/Qwen3-8B SGLANG_DIR=/path/to/sglang GPU=0 \
   HICACHE=1 FORWARD_TIMING=1 RUN_ID=server-demo \
-  CONTAINER_NAME=hicache-demo bash launch_server.sh
+  CONTAINER_NAME=hicache-demo bash launch_server.sh qwen3-8b-4k
 ```
 
 容器内 `/model`、`/experiment`、可选的 `/sgl-workspace/sglang` 只读；`/results` 可写。
 使用 HF 缓存中的完整快照路径作为 `MODEL_DIR` 时，模型仓库连同 `blobs/` 挂载到 `/model`，服务路径为 `/model/snapshots/<revision>/`。
-Docker 入口不拼装模型参数；旧模式传递环境变量，命名模式传递冻结的配置，均调用 `serve.sh --exec`。
-无配置名时的默认值仍在 `serve.sh` 定义；额外参数通过 Bash 数组传递，JSON 和带空格的路径保持完整。
+Docker 入口解析并冻结命名配置，再调用 `serve.sh --exec`。总控提供已解析配置时直接执行。
+手工启动须指定配置名；额外参数通过 Bash 数组传递，JSON 和带空格的路径保持完整。
 `GPU` 只用于 Docker 设备选择，不把宿主机编号再次传为容器 CUDA 编号。
 
 启动记录由宿主机写入，兼容 NFS root-squash。Docker 内运行 Driver 时仍识别 `EXPERIMENT_LAUNCH_DIR`。
@@ -167,7 +167,7 @@ Qwen3-8B、BF16、最大 P=120K/S=2048 的启动参数示例：
 MODEL_DIR=/workspace/models/Qwen3-8B SGLANG_DIR=/workspace/sglang \
   HICACHE=1 FORWARD_TIMING=1 HICACHE_SIZE=32 \
   CONTEXT_LENGTH=135168 MAX_TOTAL_TOKENS=135168 MEM_FRACTION=0.85 \
-  RUN_ID=l1-server bash serve.sh \
+  RUN_ID=l1-server bash serve.sh qwen3-8b-4k \
   --json-model-override-args '{"max_position_embeddings":135168}'
 ```
 
@@ -194,7 +194,7 @@ Vast 真机 GPU 验收仍需执行；CPU 模拟回归只验证部署边界和请
 - `MODEL_DIR` 现在显式指定，不再默认绑定个人 `/state/partition/...` 路径。
 - Docker 默认 `GPU=0`；native 默认保留环境的可见卡。
 - 服务参数入口集中为 `serve.sh`；`launch_server.sh` 仍是原来的 Docker 入口。
-- 客户端只快照自身；启动脚本快照在服务目录的 `launch-source/`，通过 `--server-artifacts` 可一起关联。
+- 独立客户端快照四个 Driver 文件；独立启动器保存 `launch-source/`。总控统一使用 `code/`，`samples/config.json` 相对引用服务目录，避免重复复制。
 - `--profile` 必须指定 `--server-profile-dir`；trace 留在服务端，复制到测量目录 `traces/` 后分析。
 - `--telemetry-dir` 必须同时声明 `--telemetry-same-host`。跨主机单调时钟不可比较，不能直接把远程采样拷贝过来关联请求窗口。
 

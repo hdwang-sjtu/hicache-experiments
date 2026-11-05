@@ -84,7 +84,7 @@ bash serve.sh qwen3-8b-4k --mem-fraction-static 0.85
 bash serve.sh qwen3-8b-4k --dry-run
 ```
 
-完整规则与新增配置示例见 [命名服务配置](docs/deployment.md#命名服务配置)。不带配置名的旧环境变量调用继续支持。
+完整规则与新增配置示例见 [命名服务配置](docs/deployment.md#命名服务配置)。手工启动须指定配置名，环境变量可覆盖该配置。
 
 ## 2. 客户端执行实验
 
@@ -124,8 +124,8 @@ docker exec --user "$(id -u):$(id -g)" hicache-demo \
 | `MODEL_ROOT`、`MODEL_DIR`、`SGLANG_DIR` | 两个启动入口 | 模型根目录、完整模型目录覆盖、源码 checkout；`SGLANG_DIR=''` 使用安装包 |
 | `GPU` | 启动入口 | Docker 选择物理卡；直接启动设置可见卡，省略则继承环境 |
 | `DTYPE`、`KV_DTYPE`、`TP`、`EP` | `serve.sh` | 权重/KV 精度与 TP/EP；支持 TP=1/2/4、EP=1/TP，PP=DP=1 |
-| `CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION` | 启动环境，可覆盖配置 | 无配置名时默认 40960、36864、0.7 |
-| `HICACHE`、`HICACHE_SIZE`、`FORWARD_TIMING` | 启动环境，可覆盖配置 | 无配置名时默认 0、8 GB（十进制）、0；GPU 计时需开启 HiCache |
+| `CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION` | 启动环境，可覆盖配置 | 默认值来自所选 YAML |
+| `HICACHE`、`HICACHE_SIZE`、`FORWARD_TIMING` | 启动环境，可覆盖配置 | 默认值来自所选 YAML；GPU 计时需开启 HiCache |
 | `--base-url`、`--tokenizer`、`--output-dir` | Driver | 服务地址、客户端 tokenizer、客户端结果目录 |
 | `--server-artifacts` | Driver，可选 | 客户端可读的启动记录目录或其副本，不要求共享磁盘 |
 | `--profile --server-profile-dir /path` | Driver，诊断用 | 在服务端指定路径写 trace；正式扫描关闭 Profiler |
@@ -135,7 +135,7 @@ docker exec --user "$(id -u):$(id -g)" hicache-demo \
 ## 输出与当前边界
 
 `config.json`、`inputs.json`、`responses.jsonl`、`samples.csv`、`summary.csv`、图表和 Driver 快照保存在测量目录。
-可选启动记录包括源码版本、补丁、镜像 ID、启动命令和日志。实验记录写在 `docs/experiments/`；原始数据放 `results/`，不纳入 Git。
+可选启动记录包括源码版本、补丁、镜像 ID、启动命令和日志。实验记录写在 `docs/experiments/`；原始数据放 `results/`，不纳入 Git。总控的源码统一在 `code/`，服务证据在 `server/`；`samples/config.json` 用相对路径引用它们。
 
 ```bash
 python3 run_experiment.py analyze results/samples-demo
@@ -152,6 +152,5 @@ Prefix lookup 独立时间尚未导出。真实 GPU 和新云平台需各自验�
 
 ```bash
 bash -n launch_server.sh serve.sh
-python3 run_experiment.py self-test
 python3 -m unittest discover -s tests -v
 ```

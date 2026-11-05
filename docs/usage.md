@@ -6,16 +6,16 @@
 
 ## 怎么读这些入口
 
-`serve.sh` 使用命名 YAML 或旧环境变量模式：读取配置 → 组装 SGLang 命令 → 保存启动记录 → exec 服务进程。
+`serve.sh` 读取命名 YAML 或总控已解析配置：读取配置 → 组装 SGLang 命令 → 保存启动记录 → exec 服务进程。
 `launch_server.sh` 负责 Docker 镜像、挂载和生命周期，在容器内调用 `serve.sh`。
-常用服务参数保存在 `configs/serve/`，通过共用的 `serve_config.py` 解析；旧模式默认值仍在 `serve.sh` 的 `server_args`。
+常用服务参数保存在 `configs/serve/`，通过共用的 `serve_config.py` 解析，默认值只在 YAML 中定义。
 修改挂载时看 `launch_server.sh` 的 `docker_args`。
 两者通过内部工具 `launch_metadata.py` 保存记录。已有 Python 环境直接用 `serve.sh`，不需要 Docker。
 
 `run_experiment.py` 可以按下面的调用顺序阅读：
 
 ```text
-main()                       解析 run / analyze / self-test 子命令
+main()                       解析 run / analyze 等子命令
 └── run()                    准备目录和输入，等待并检查服务，保存最终状态
     ├── make_cases()         构造精确 P、S，单独准备 P
     ├── check_server()       检查 TP/EP、单请求、上下文长度和 KV 容量
@@ -23,8 +23,10 @@ main()                       解析 run / analyze / self-test 子命令
     │   └── execute_sample() 清空缓存 → 按组准备 → 测量 → 校验
     │       ├── Client      发送 HTTP 请求并保存原始响应
     │       └── validate()  检查长度、各层命中、回撤和时间字段
-    └── analyze()            过滤无效样本，输出 Median、P95 和图表
+    └── experiment_results  过滤无效样本，输出 Median、P95 和图表
 ```
+
+`rank_metrics.py` 集中处理所有 rank 的指标；`experiment_diagnostics.py` 保存可选遥测和 trace 分析。模拟测试集中在 `tests/`，运行 `python3 -m unittest discover -s tests`。
 
 有两种容易混淆的“预热”：`warmup` 是每个长度组合开始时的运行预热，不写入测量 CSV；`prepare` 是每一次 L1 样本都必须重新做的 P 请求，用来构造缓存状态。
 `measure` 才是计入 CSV 的 P+S 请求，且其清空和准备耗时不计入客户端测量延迟。
@@ -40,7 +42,7 @@ main()                       解析 run / analyze / self-test 子命令
 ```bash
 cd /path/to/hicache-experiments
 export MODEL_DIR=/path/to/Qwen3-8B
-GPU=3 HICACHE=1 RUN_ID=l2-demo CONTAINER_NAME=hicache-l2 bash launch_server.sh
+CONTEXT_LENGTH=40960 MAX_TOTAL_TOKENS=36864 GPU=3 HICACHE=1 RUN_ID=l2-demo CONTAINER_NAME=hicache-l2 bash launch_server.sh qwen3-8b-4k
 ```
 
 `HICACHE=1` 固定 Python TreeCore，开启 CPU 持久缓存、`write_through` 和本地实验接口；CPU KV 池默认 8 GB（十进制，约 7.45 GiB），可用 `HICACHE_SIZE` 修改。没有启用 L3。
@@ -91,17 +93,16 @@ JSON/IPC 传入的 token IDs 是 `list`；接口在匹配前转换为 serving �
 
 ## 参数与结果
 
-可使用 [命名服务配置](deployment.md#命名服务配置)，也可继续通过旧环境变量模式启动，额外参数直接追加给 SGLang：
+使用 [命名服务配置](deployment.md#命名服务配置)，环境变量覆盖配置，额外参数直接追加给 SGLang：
 
 ```bash
 GPU=1 MODEL_DIR=/path/to/local/model DTYPE=bfloat16 KV_DTYPE=bfloat16 \
-  RUN_ID=another-model bash launch_server.sh
+  RUN_ID=another-model bash launch_server.sh qwen3-8b-4k
 ```
 
 可覆盖 `SGLANG_DIR`、`IMAGE`、`PORT`、`CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION`、`RESULTS_DIR`。
 `TP`/`EP` 是启动参数；Driver 支持 TP=1/2/4、EP=1/TP，要求 PP=DP=1。多 rank 必须启用所有 scheduler 指标与 GPU timing。
-无配置名时默认上下文 40960、KV 容量上限 36864 tokens、chunk size 4096、并发 1、Graph 关闭、overlap 保留。
-`qwen3-8b-4k` 则使用 4096 总上下文和 8192 KV 槽位，应使用 P=2K 的小点验收，不能照搬本页旧模式的 8K/32K 命令。
+`qwen3-8b-4k` 默认总上下文 4096、KV 槽位 8192，适合 P=2K 小点。本文 8K/32K 示例显式扩大了上下文和 KV 容量；并发 1、Graph 关闭、chunk 4096 等设置仍来自 YAML。
 其他模型需自行设置正确上下文长度，dtype 必须由模型及所用后端支持。
 
 ## GPU 计时和 Profiler
@@ -113,8 +114,9 @@ GPU=1 MODEL_DIR=/path/to/local/model DTYPE=bfloat16 KV_DTYPE=bfloat16 \
 重新启动专用服务，三组都启用相同的计时设置：
 
 ```bash
-MODEL_DIR=/path/to/Qwen3-8B GPU=1 HICACHE=1 FORWARD_TIMING=1 RUN_ID=timing-demo \
-  CONTAINER_NAME=hicache-timing bash launch_server.sh
+MODEL_DIR=/path/to/Qwen3-8B CONTEXT_LENGTH=40960 MAX_TOTAL_TOKENS=36864 \
+  GPU=1 HICACHE=1 FORWARD_TIMING=1 RUN_ID=timing-demo \
+  CONTAINER_NAME=hicache-timing bash launch_server.sh qwen3-8b-4k
 ```
 
 第二个终端先采集诊断时间线，缓存准备与逐出不进入 Profiler 区间：
@@ -190,7 +192,7 @@ GPU 采样使用 NVML，记录四卡的计算进程、利用率、显存、SM/�
 - `cache_valid`：缓存命中、长度、传输计数、正常结束及输出一致性检查。
 - `environment_valid`：上述采样覆盖及选定 GPU 的进程检查。
 - `valid`：两项同时满足，才计入每组的 10 个正式样本。
-- `summary.csv`：正式有效样本的统计；`all_cache_valid_summary.csv`：所有缓存有效尝试的统计，包括环境检查失败者。
+- `summary.csv`：正式有效样本的统计；`all_cache_valid_summary.csv`（仅启用环境过滤时生成）：所有缓存有效尝试的统计，包括环境检查失败者。
 
 这种采样仍不能证明整机无干扰；其他卡的活动和共享主机资源可能产生影响，原始监控与异常理由随数据保存。
 `prefill_forward_gpu_ms` 仍是流区间，可能包含提交间隙，不能叫作纯 Kernel 时间。
@@ -256,7 +258,7 @@ Driver 本身不负责后台作业编排。`run_all.py` 管理整轮服务和测
 | `device_used_tokens_before/after` / `host_used_tokens_before/after` | 请求前后，缓存池中已用的 token 槽位数，不是 CUDA allocator 占用字节数 |
 
 HiCache 模式下，接口先确认空闲，脚本再读取 `/metrics` 基准；测量请求结束后等 ACK 被处理，再读取终值。两个指标快照之间没有 flush，也不包含其他测量请求。
-GPU timing 任务逐 rank 读取 KV/Mamba 池与 forward 指标；时间取最大 rank，逻辑 token 数不累加，字节数合计。未启用 GPU timing 的旧 FULL-KV 单卡路径只读取 KV 指标。首次加载前显式初始化零值；缺失、重复、倒退或传输量不符时，不得作为有效样本。
+GPU timing 任务逐 rank 读取 KV/Mamba 池与 forward 指标；时间取最大 rank，逻辑 token 数不累加，字节数合计。FULL-KV 单卡未启用 GPU timing 时，由同一指标模块仅读取 H2D 指标，不要求 forward 计数。首次加载前显式初始化零值；缺失、重复、倒退或传输量不符时，不得作为有效样本。
 H2D 时间包含逐层提交之间的空隙，但不含之前的排队、索引准备和 fence 等待；它可与 Prefill 重叠，不能直接与首 token 延迟相加。
 关闭 HiCache 的旧结果没有这些测量，新列留空；`analyze` 继续兼容原 CSV。
 
@@ -277,7 +279,7 @@ Median 和 P95 仅对有效样本计算；P95 使用排序后线性插值。少�
 - `responses.jsonl`：控制操作、预热和测量的原始响应，阶段分别标记；成功的 `/metrics` 响应只在内存中解析，不逐次归档全文，查询失败仍记录错误。
 - `rank-metrics.jsonl`：GPU timing 任务保存各请求逐 rank 的指标起点、终点与差值，用于复核计时和缓存命中。
 - `samples.csv`：每个测量样本及有效性；`summary.csv`：有效样本 Median / P95 和无效计数。
-- `latency.png`：服务端首 token 延迟图（需要 matplotlib）；`source/` 保存 Driver 运行版本；`launch-source/` 保存可选的服务启动脚本快照。
+- `latency.png`：服务端首 token 延迟图（需要 matplotlib）；独立 Driver 的 `source/` 保存全部客户端模块，独立启动器的 `launch-source/` 保存启动脚本。总控统一保存 `code/`，Driver 用相对路径引用 `../code`、`../server`，无需重复副本。
 
 目录不得复用。失败尝试保留原始数据并标明状态，不计为已完成实验。
 一个服务可对应多个测量目录，后续目录关联原始启动信息；没有启动证据时无法证明镜像和源码版本。

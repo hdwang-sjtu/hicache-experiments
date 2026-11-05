@@ -107,10 +107,11 @@ results/<run-id>/
 ├── run.json                  # 总体状态、阶段、退出码及失败原因
 ├── experiment.yaml           # 原始实验配置
 ├── resolved-experiment.json  # 应用 CLI 覆盖后的实验配置
+├── resolved-serve.json       # 包含最终容量和模型路径，启动器直接执行
 ├── gpu-memory.jsonl          # 启动至清理期间的采样显存与阶段
 ├── runtime.lock.json         # 版本锁
 ├── sglang.patch              # 本轮补丁
-├── code/                     # 实际使用的入口/Driver/服务配置快照
+├── code/                     # 实际运行的入口、Driver 及共享模块
 ├── source.json / model.json  # 准备阶段来源与复用信息
 ├── prepare.log               # 依赖检查、源码及模型准备日志
 ├── server-launch.log         # 服务启动器日志
@@ -161,3 +162,5 @@ Vast 的 SSH/Jupyter 模式会替换原镜像 entrypoint，应将任务命令放
 CPU 回归只验证流程和故障清理，真实 GPU 性能与 Vast 部署需要在目标机器上验收。
 
 Qwen3.5 的 TP/EP、P/S、分块及容量覆盖命令见 [Qwen3.5 实验](qwen35.md)。Vast On-start 中也使用同一 `run_all.py` 命令，并把 `RESULTS_DIR` 指向持久卷。
+
+总控结果中，`code/` 保存所有运行脚本；`samples/config.json` 的 `source_directory`、`server_artifacts` 和 `server_log_path` 相对指向本轮源码及服务记录。迁移时复制整个 `<run-id>/`；无需在 `samples/` 再存日志和源码。未启用环境过滤时只生成 `summary.csv`，避免重复的 `all_cache_valid_summary.csv`。

@@ -14,9 +14,43 @@ import threading
 import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+from experiment_results import DRIVER_FILES
 
 
 class Launchers(unittest.TestCase):
+    def test_frozen_launch_needs_no_profiles_and_reuses_code_archive(self):
+        from run_all import CODE_FILES
+        import serve_config
+        task = self.root / 'managed-result'
+        code = task / 'code'
+        code.mkdir(parents=True)
+        for name in CODE_FILES:
+            shutil.copyfile(PROJECT / name, code / name)
+        resolution = serve_config.resolve('qwen3-8b-4k', 'native', [], self.env)
+        resolution['server']['context-length'] = 135168
+        resolution['server_yaml'] = serve_config.yaml_module().safe_dump(resolution['server'])
+        frozen = task / 'resolved-serve.json'
+        frozen.write_text(json.dumps(resolution))
+        result = subprocess.run(['bash', str(code / 'serve.sh'), '--resolved-profile', str(frozen)],
+                                env={**self.env, 'RESULTS_DIR': str(task), 'RUN_ID': 'server',
+                                     'CONTEXT_LENGTH': '1024', 'MODEL_DIR': '/wrong', 'FORWARD_TIMING': '0'},
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recorded = json.loads((task / 'server/profile-resolution.json').read_text())
+        self.assertEqual(recorded['server']['context-length'], 135168)
+        self.assertEqual(recorded['server']['model-path'], str(self.model))
+        self.assertEqual(recorded['environment']['SGLANG_ENABLE_METRICS_DEVICE_TIMER'], '1')
+        self.assertFalse((task / 'server/launch-source').exists())
+        self.assertEqual(json.loads((task / 'server/launch.json').read_text())['launcher_source'], '../code')
+
+    def test_missing_profile_fails_before_creating_results(self):
+        for script in ('serve.sh', 'launch_server.sh'):
+            result = self.run_script(script)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('--list-configs', result.stderr)
+            self.assertFalse((self.root / 'results').exists())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="hicache launch ")
         self.addCleanup(self.temp.cleanup)
@@ -62,7 +96,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
                               text=True, capture_output=True, timeout=15)
 
     def test_native_records_actual_command_and_failure(self):
-        result = self.run_script("serve.sh", "--json-model-override-args", '{"max_position_embeddings":135168}',
+        result = self.run_script("serve.sh", "qwen3-8b-4k", "--json-model-override-args", '{"max_position_embeddings":135168}',
                                  FAKE_EXIT="7", GPU="2", HICACHE="1", FORWARD_TIMING="1")
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertIn("fake server started", result.stdout)
@@ -75,7 +109,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         self.assertTrue((self.root / "results/test/launch-source/serve.sh").exists())
         # 重复启动不得覆盖记录，也不应再次运行模型进程。
         (self.root / "capture.json").unlink()
-        self.assertNotEqual(self.run_script("serve.sh").returncode, 0)
+        self.assertNotEqual(self.run_script("serve.sh", "qwen3-8b-4k").returncode, 0)
         self.assertFalse((self.root / "capture.json").exists())
 
 
@@ -147,7 +181,7 @@ elif command[0] == 'wait': print('17')
         blobs.mkdir()
         (blobs/'config').write_text('{}')
         (snapshot/'config.json').symlink_to('../../blobs/config')
-        for profile in (None, 'qwen3-8b-4k'):
+        for profile in ('qwen3-8b-4k',):
             with self.subTest(profile=profile):
                 run_id = 'hf-named' if profile else 'hf-generic'
                 self.fake_docker()
@@ -170,8 +204,8 @@ class RemoteClient(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         # 只复制客户端，不提供 serve.sh、Docker、SGLang 或模型权重。
-        shutil.copyfile(PROJECT / "run_experiment.py", self.root / "run_experiment.py")
-        shutil.copyfile(PROJECT / "rank_metrics.py", self.root / "rank_metrics.py")
+        for name in DRIVER_FILES:
+            shutil.copyfile(PROJECT / name, self.root / name)
         (self.root / "transformers.py").write_text('''
 class AutoTokenizer:
     all_special_ids = []
@@ -237,7 +271,7 @@ class AutoTokenizer:
         env = dict(os.environ)
         env.pop("EXPERIMENT_LAUNCH_DIR", None)
         return subprocess.run([
-            sys.executable, str(self.root / "run_experiment.py"), "run",
+            sys.executable, str(getattr(self, 'script', self.root / "run_experiment.py")), "run",
             "--base-url", f"http://127.0.0.1:{self.server.server_port}",
             "--tokenizer", str(self.root), "--output-dir", str(self.root / "results"),
             "--prefix-lengths", "8", "16", "--suffix-lengths", "2", "4",
@@ -255,7 +289,31 @@ class AutoTokenizer:
             rows = list(csv.DictReader(file))
         self.assertEqual(len(rows), 16)
         self.assertTrue(all(row["valid"] == "True" for row in rows))
-        self.assertEqual(sorted(p.name for p in (self.root / "results/source").iterdir()), ["rank_metrics.py", "run_experiment.py"])
+        self.assertEqual(sorted(p.name for p in (self.root / "results/source").iterdir()), sorted(DRIVER_FILES))
+
+    def test_managed_client_references_existing_evidence_without_copying(self):
+        code, server = self.root / 'code', self.root / 'server'
+        alias = self.root / 'experiment'
+        code.mkdir()
+        server.mkdir()
+        alias.mkdir()
+        for name in DRIVER_FILES:
+            shutil.copyfile(PROJECT / name, code / name)
+            # 模拟 Docker 的双重 bind mount：路径不同，底层文件身份相同。
+            (alias / name).hardlink_to(code / name)
+        shutil.copyfile(self.root / 'transformers.py', alias / 'transformers.py')
+        (server / 'launch.json').write_text('{"runtime":"native"}')
+        (server / 'server.log').write_text('one canonical server log\n')
+        self.script = alias / 'run_experiment.py'
+        result = self.run_client('--server-artifacts', str(server))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        directory = self.root / 'results'
+        config = json.loads((directory / 'config.json').read_text())
+        self.assertEqual(config['source_directory'], '../code')
+        self.assertEqual(config['server_artifacts'], '../server')
+        self.assertEqual(config['server_log_path'], '../server/server.log')
+        for name in ('source', 'launch.json', 'server.log', 'all_cache_valid_summary.csv'):
+            self.assertFalse((directory / name).exists(), name)
 
     def test_profile_path_belongs_to_server_and_artifacts_are_optional_copies(self):
         artifacts = self.root / "copied-launch"

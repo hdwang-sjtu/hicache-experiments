@@ -21,7 +21,7 @@ LOAD = {
 
 
 class PendingMetrics(RuntimeError):
-    pass
+    """计数尚未到齐，可以继续等；拓扑错误、超量或倒退则直接失败。"""
 
 
 def rank_states(state, tp):
@@ -32,6 +32,7 @@ def rank_states(state, tp):
 
 
 def check_state(state, group, p, tp):
+    """检查每张卡的完整 P 检查点；GPU KV 命中不能代替线性状态检查。"""
     for rank, value in rank_states(state, tp).items():
         wanted = dict(device_tokens=p if group == 'l1' else 0,
                       host_hit_tokens=p if group == 'l2' else 0,
@@ -46,9 +47,16 @@ def check_state(state, group, p, tp):
                 raise RuntimeError(f'rank={rank} {group} {key}: {value.get(key)} != {expected}')
 
 
-def parse_metrics(text, tp, ep, hybrid):
+def parse_metrics(text, tp, ep, hybrid, *, gpu_timing=True):
+    """一套解析规则覆盖单卡/多卡；未启用计时时只要求 H2D 指标。
+
+    Prometheus 全文只在内存中筛选。缺失值不能填零，重复 label 不能累加，
+    否则可能把其他模型或 rank 的活动误算作本次请求。
+    """
     result = {rank: {} for rank in range(tp)}
-    required = set(FORWARD.values()) | set(LOAD.values()) | {'kv_tokens'}
+    required = set(LOAD.values()) | {'kv_tokens'}
+    if gpu_timing:
+        required.update(FORWARD.values())
     if hybrid:
         required.add('mamba_states')
     for line in text.splitlines():
@@ -82,11 +90,17 @@ def parse_metrics(text, tp, ep, hybrid):
     return result
 
 
-def metric_delta(before, after, *, p, s, group, chunk, state):
+def metric_delta(before, after, *, p, s, group, chunk, state, gpu_timing=True):
+    """只接受与本次输入、缓存层级和实际池大小一致的累计差值。
+
+    服务必须独占且单请求；计数差值本身没有 request ID。Cold 计算 P+S，
+    命中后计算 S；各 rank 的逻辑 token 应相同，物理传输量分别检查。
+    """
     compute = p + s if group == 'cold' else s
-    expected = dict(passes=math.ceil(compute / chunk), compute=compute, input=compute,
-                    device=p if group == 'l1' else 0, host=p if group == 'l2' else 0,
-                    storage=0, kv_tokens=p if group == 'l2' else 0)
+    expected = dict(kv_tokens=p if group == 'l2' else 0)
+    if gpu_timing:
+        expected.update(passes=math.ceil(compute / chunk), compute=compute, input=compute,
+                        device=p if group == 'l1' else 0, host=p if group == 'l2' else 0, storage=0)
     deltas, pending = {}, []
     states = rank_states(state, len(before))
     if set(before) != set(after):
@@ -101,7 +115,7 @@ def metric_delta(before, after, *, p, s, group, chunk, state):
                 raise RuntimeError(f'rank={rank} {key}: {delta[key]} > {wanted}')
             if delta[key] < wanted:
                 pending.append(f'{rank}:{key}')
-        if delta['seconds'] <= 0:
+        if gpu_timing and delta['seconds'] <= 0:
             pending.append(f'{rank}:seconds')
         if group == 'l2':
             copies = delta.get('mamba_states', 0)
@@ -122,21 +136,27 @@ def metric_delta(before, after, *, p, s, group, chunk, state):
 
 
 class RankMetrics:
-    def __init__(self, client, info, hybrid, path):
+    """将等待、校验、归档集中在这里，Driver 只标明请求边界。"""
+
+    def __init__(self, client, info, hybrid, path, *, gpu_timing=True):
         self.client, self.path = client, path
         self.tp, self.ep = info['tp_size'], info.get('ep_size', 1)
         self.hybrid = hybrid
-        self.chunk = info['chunked_prefill_size']
+        self.gpu_timing = gpu_timing
+        self.chunk = info.get('chunked_prefill_size')
 
     def snapshot(self, stage, before=None, **expected):
+        # HTTP 返回不代表所有 CUDA Event 已发布。先检查预期计数，再要求所选
+        # 指标稳定 400 ms；这是保守等待策略，不是服务端的“统计提交完成”ACK。
+        # 此等待发生在 generate 计时之外；50 ms 是轮询间隔，不是计时精度。
         deadline = time.monotonic() + self.client.timeout
         previous, since, reason = None, time.monotonic(), '尚无指标'
         while True:
             try:
                 raw, _ = self.client.request('/metrics', stage=stage, parse_json=False)
-                snapshot = parse_metrics(raw, self.tp, self.ep, self.hybrid)
+                snapshot = parse_metrics(raw, self.tp, self.ep, self.hybrid, gpu_timing=self.gpu_timing)
                 if before is not None:
-                    metric_delta(before, snapshot, chunk=self.chunk, **expected)
+                    metric_delta(before, snapshot, chunk=self.chunk, gpu_timing=self.gpu_timing, **expected)
                 now = time.monotonic()
                 if previous != snapshot:
                     previous, since = snapshot, now
@@ -150,15 +170,18 @@ class RankMetrics:
 
     def finish(self, before, stage, rid, **expected):
         after = self.snapshot(stage + ':metrics_after', before, **expected)
-        delta = metric_delta(before, after, chunk=self.chunk, **expected)
+        expectation = dict(expected, chunk=self.chunk, gpu_timing=self.gpu_timing)
+        delta = metric_delta(before, after, **expectation)
         record = dict(stage=stage, request_id=rid, tp=self.tp, ep=self.ep,
-                      expected=dict(expected, chunk=self.chunk), before=before, after=after, deltas=delta)
+                      expected=expectation, before=before, after=after, deltas=delta)
         with self.path.open('a') as file:
             file.write(json.dumps(record) + '\n')
-        # Logical token counts are identical across TP ranks; never sum them.
-        return dict(prefill_forward_gpu_ms=max(d['seconds'] for d in delta.values()) * 1000,
-                    kv_load_ms=max(d['load_seconds'] for d in delta.values()) * 1000,
+        # 时间取最慢 rank；逻辑 token 不按卡累加，物理字节数才求和。
+        result = dict(kv_load_ms=max(d['load_seconds'] for d in delta.values()) * 1000,
                     kv_load_tokens=delta[0]['kv_tokens'], kv_load_bytes=sum(d['load_bytes'] for d in delta.values()),
                     kv_load_ops=max(d['load_ops'] for d in delta.values()),
-                    prefill_forward_passes=delta[0]['passes'],
                     mamba_load_states=delta[0].get('mamba_states', 0))
+        if self.gpu_timing:
+            result.update(prefill_forward_gpu_ms=max(d['seconds'] for d in delta.values()) * 1000,
+                          prefill_forward_passes=delta[0]['passes'])
+        return result

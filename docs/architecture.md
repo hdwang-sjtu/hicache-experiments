@@ -27,9 +27,12 @@
 |---|---|---|
 | [run_all.py](../run_all.py) | 用户或平台启动命令 | 编排准备、服务、Driver、结果验收与清理；保存任务状态。导入 Driver 复用参数解析，实际采样仍启动独立进程。 |
 | [prepare_runtime.py](../prepare_runtime.py) | 总控的准备子进程；总控也导入其锁与 JSON 写入工具 | 固定基线检出、补丁校验与应用、固定 revision 模型下载和缓存完整性检查；准备阶段与推理计时分开。 |
-| [serve.sh](../serve.sh) | 用户、总控 native 分支、Docker 包装 | 在当前 Python 环境组装并执行 SGLang 命令；支持命名配置和旧环境变量模式。旧模式服务默认参数集中在此处。 |
+| [serve.sh](../serve.sh) | 用户、总控 native 分支、Docker 包装 | 在当前 Python 环境执行 SGLang；接受命名配置或总控已解析配置。服务默认值统一来自 YAML。 |
 | [launch_server.sh](../launch_server.sh) | 用户或总控 Docker 分支 | 将本地镜像引用固定为镜像 ID，设置 GPU、挂载和容器生命周期；调用容器内 `serve.sh`。独立使用时要求镜像已在本地。 |
-| [run_experiment.py](../run_experiment.py) | 用户或总控；总控还导入其参数解析函数 | `run` 构造精确 token 输入、控制缓存、串行请求、校验和汇总；`analyze` 重算统计与图表；另提供 `self-test`、`monitor`、`analyze-traces`。可单独复制到客户端。 |
+| [run_experiment.py](../run_experiment.py) | 用户或总控；总控还导入其参数解析函数 | `run` 构造精确 token 输入、控制缓存、串行请求、校验和汇总；`analyze`、`monitor`、`analyze-traces` 委托给下面的功能模块。客户端需一起复制四个 Driver 文件。 |
+| [rank_metrics.py](../rank_metrics.py) | Driver 和总控结果验收 | 逐 rank 缓存状态、Prometheus 解析、等待、差值验收与证据归档；单卡/多卡共用。 |
+| [experiment_results.py](../experiment_results.py) | Driver、诊断模块 | CSV 字段、来源归档、Median/P95 和绘图；不请求服务。 |
+| [experiment_diagnostics.py](../experiment_diagnostics.py) | Driver 按需导入 | 可选的同机环境遥测和 Profiler trace 分析。 |
 | [serve_config.py](../serve_config.py) | 总控及两个启动脚本 | 读取命名 YAML，解析路径与显式覆盖，输出启动配置和预览。只处理配置数据，不导入 SGLang/Torch；完整服务参数由 SGLang 原生解析器检查。 |
 | [launch_metadata.py](../launch_metadata.py) | 两个启动脚本 | 写入启动命令、源码版本/差异、配置、启动器快照及 GPU 信息；Docker 记录镜像身份，native 记录当前 Python 包信息。使用标准库，不参与请求和推理。 |
 
@@ -49,6 +52,7 @@
 | 文件或目录 | 使用者 | 职责 |
 |---|---|---|
 | [tests/test_deployment.py](../tests/test_deployment.py) | unittest | 用模拟服务、解释器和 Docker 检查启动记录、配置冻结、路径重写、独立 HTTP 客户端及远程路径/时钟边界。 |
+| [tests/test_driver.py](../tests/test_driver.py) | unittest | 输入、采样、校验、统计和诊断的模拟回归，替代原先内嵌的 `self-test`。 |
 | [tests/test_run_all.py](../tests/test_run_all.py) | unittest | 检查总控成功/失败清理、已有端口保护、精确容器身份及模型补齐与复用。 |
 | [README.md](../README.md) | 使用者 | 工程入口、简图和最小运行命令。 |
 | [docs/architecture.md](architecture.md) | 维护者 | 文件职责、调用关系、配置与数据边界。 |
@@ -59,7 +63,7 @@
 
 ## 两个启动脚本怎样共用工具
 
-命名模式下，两种入口都使用 `serve_config.py`，遵循 **命令行 > 显式环境变量 > 配置文件**。
+独立启动时，两种入口都使用 `serve_config.py`，遵循 **命令行 > 显式环境变量 > 配置文件**。
 native 由 `serve.sh` 解析配置，再调用 `launch_metadata.py` 写记录，最后执行 SGLang。
 Docker 由宿主机上的 `launch_server.sh` 解析模型路径并将容器路径改为 `/model`（HF 快照为 `/model/snapshots/<revision>/`），调用同一记录工具保存配置，再将冻结的 `profile-resolution.json` 交给容器内的 `serve.sh --exec --resolved-profile`。
 容器内仅解包已解析配置，不重新读取原始 YAML，也不重复生成启动记录。
@@ -67,8 +71,7 @@ Docker 由宿主机上的 `launch_server.sh` 解析模型路径并将容器路�
 命名启动保存的 `profile.yaml` 是原文，`server-config.yaml` 是环境覆盖后的下发配置，`profile-resolution.json` 保存路径、环境和 CLI 信息；CLI 仍可覆盖下发 YAML。
 最终配置再由 Driver 获取的 `/server_info` 确认。具体覆盖和模型路径规则见 [命名服务配置](deployment.md#命名服务配置)。
 
-不带配置名时，旧环境变量模式继续可用；默认服务参数由 `serve.sh` 统一定义。
-Docker 包装只转交显式变量和追加参数，并调用 `serve.sh --exec`；启动记录仍由宿主机调用 `launch_metadata.py` 写入。
+总控在初始化时合并配置，模型准备后补入实际路径，写出 `resolved-serve.json`。两个启动器通过 `--resolved-profile` 直接执行这份配置，不再次读取 YAML 或环境覆盖。手工启动须指定配置名；已删除无配置名时的另一套默认值。
 两个启动脚本都不下载模型或准备 SGLang 源码，这些工作由总控或部署侧完成。
 
 ## 实验配置、服务配置与版本锁
@@ -80,7 +83,7 @@ Docker 包装只转交显式变量和追加参数，并调用 `serve.sh --exec`�
 - **版本锁与补丁**决定总控准备的运行代码：`sglang_base` 是实际 checkout 的 HEAD，工作区再应用锁定哈希的补丁；`patch_source_commit` 记录补丁来源，并不是准备时检出的 HEAD。官方镜像本身不会自动包含本地实验补丁。
 
 显式 `--model-dir`/`MODEL_DIR` 时总控检查指定目录，完整就直接使用，缺文件则按实验配置的仓库和版本补齐。
-不指定目录时，由 HF 库下载/复用默认缓存并返回实际模型路径；总控取得路径后才向启动器传入 `MODEL_DIR`。准备前的服务配置解析不要求模型路径，`--dry-run` 的 `model_directory` 为 `null` 表示由 HF 自动选择。
+不指定目录时，由 HF 库下载/复用默认缓存并返回实际模型路径；总控取得路径后才补全最终服务配置中的模型路径。准备前的服务配置解析不要求模型路径，`--dry-run` 的 `model_directory` 为 `null` 表示由 HF 自动选择。
 总控不再使用 `MODEL_ROOT`；独立启动脚本仍保留原来的手工路径选项。准备好的源码缓存路径通过 `SGLANG_DIR` 传给启动器。
 源码缓存复用前检查基线与实际差异；模型检查配置、索引和 safetensors 头部，模型准备只有一个函数，不新增缓存完成标记。详细规则见 [固定版本与缓存](cloud-task.md#固定版本与缓存)。
 
@@ -113,8 +116,8 @@ Driver 不直接调用服务端 Python 对象，也不要求共享磁盘：`--to
 | 位置 | 内容与用途 |
 |---|---|
 | `results/<run-id>/`（总控） | `run.json` 记录任务状态与失败阶段；实验 YAML、版本锁、补丁和 `code/` 保存本轮快照；`source.json`、`model.json` 保存准备来源；各阶段日志用于排障。完整布局见 [结果、失败与清理](cloud-task.md#结果失败与清理)。 |
-| 总控的 `server/`；独立启动的 `RESULTS_DIR/RUN_ID` | `launch.json`、配置解析记录、`launch-source/`、源码差异、GPU 信息和服务日志；Docker 另保存 `container.id`。 |
-| 总控的 `samples/`；独立 Driver 的 `--output-dir` | 输入、原始响应、样本 CSV、汇总、图表及 Driver 快照；可关联启动记录。字段与统计规则见 [运行与指标参考](usage.md)。 |
+| 总控的 `server/`；独立启动的 `RESULTS_DIR/RUN_ID` | `launch.json`、配置解析记录、源码差异、GPU 信息和服务日志；Docker 另保存 `container.id`。 |
+| 总控的 `samples/`；独立 Driver 的 `--output-dir` | 输入、原始响应、样本 CSV、汇总、图表；总控引用 `../code` 和 `../server`，独立 Driver 保存自己的源码和可选启动记录副本。字段与统计规则见 [运行与指标参考](usage.md)。 |
 | `.cache/sglang/<基线>-<补丁哈希>/checkout/` | 总控校验后复用的源码，避免修改手工准备的 checkout。 |
 | `~/.cache/huggingface/hub/models--<组织>--<模型名>/snapshots/<revision>/` | 默认 HF 模型缓存，沿用 `HF_HOME` / `HF_HUB_CACHE`；快照引用同仓库 `blobs/`，Docker 挂载两者所在的仓库目录。 |
 | `.cache/locks/` 及源码缓存旁的锁文件 | 限制同一端口的任务和同一源码缓存的并发准备；模型下载的文件锁由 HF 库负责。 |
@@ -137,3 +140,11 @@ Driver 不直接调用服务端 Python 对象，也不要求共享磁盘：`--to
 补丁中的 Scheduler 将控制请求广播后的本地检查结果汇聚，所有 rank 通过后才执行 GPU 驱逐，再汇聚执行结果。FULL+MAMBA 路径要求 P 边界同时存在 KV 与线性状态备份；详细过程见 [Qwen3.5 实验](qwen35.md)。
 
 `tests/test_parallel_cache.py` 检查分布式预检失败不释放、部分执行失败、缺失 rank、状态和传输计数以及容量边界。历史 L1 工作区保持独立，不作为主项目运行时依赖。
+
+## 维护时从哪里入手
+
+- 修改测量步骤：读 `run_samples → execute_sample → validate`；准备 P、等待备份/指标和 L2 demote 都在正式 HTTP 计时之外。
+- 修改指标：读 `RankMetrics.snapshot → metric_delta → finish`。缺失/尚未到齐可以等待，超量/倒退/错误 rank 必须终止；400 ms 稳定窗口是保守策略，不是服务端提交 ACK。
+- 修改配置：服务默认值只改 YAML；Driver 参数在 `build_run_parser` 定义一次，总控使用它返回的公开 Action 进行类型检查。
+- 修改归档：总控保存一份 `code/`，启动器保存 `server/`，Driver 保存 `samples/`。独立运行仍自带必要副本；迁移总控结果应复制整个运行目录。
+- 验证：`python3 -m unittest discover -s tests -v`。CPU 回归检查编排与协议，历史结果重算检查统计；GPU/新平台的真实性能仍需单独验收。

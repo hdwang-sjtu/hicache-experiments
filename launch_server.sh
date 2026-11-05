@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ ${1:-} == --help ]]; then
     cat <<'HELP'
-用法：bash launch_server.sh [配置名] [--dry-run] [SGLang 参数 ...]
+用法：bash launch_server.sh <配置名> [--dry-run] [SGLang 参数 ...]
   MODEL_ROOT=/models GPU=0 bash launch_server.sh qwen3-8b-4k
   bash launch_server.sh --list-configs
-无配置名时兼容 MODEL_DIR=/path/to/model bash launch_server.sh。
+必须选择配置名，服务参数统一来自命名配置。
 需要宿主机 Docker + NVIDIA runtime、本地已有镜像和模型。
 已有 SGLang 环境（包括 Vast 普通容器）请直接用 bash serve.sh。
   MODEL_ROOT / MODEL_DIR   模型根目录 / 完整模型目录覆盖（均为宿主机路径）
@@ -24,9 +24,11 @@ HELP
 fi
 dry_run=false
 profile=""
+resolved_profile=""
 while (($#)); do
     case "$1" in
         --dry-run) dry_run=true; shift ;;
+        --resolved-profile) resolved_profile="${2:?缺少已解析配置路径}"; shift 2 ;;
         --list-configs) python3 "$SCRIPT_DIR/serve_config.py" list; exit ;;
         --) shift; break ;;
         -*) break ;;
@@ -36,16 +38,19 @@ while (($#)); do
 done
 profile_json=""
 profile_environment=()
-if [[ -n "$profile" ]]; then
+if [[ -n "$resolved_profile" ]]; then
+    [[ -z "$profile" && $# == 0 ]] || { echo '已解析配置不能追加参数。' >&2; exit 2; }
+    profile_json="$(cat "$resolved_profile")"
+elif [[ -n "$profile" ]]; then
     profile_json="$(python3 "$SCRIPT_DIR/serve_config.py" resolve --runtime docker "$profile" -- "$@")"
-    mapfile -d '' -t values < <(python3 "$SCRIPT_DIR/serve_config.py" unpack <<< "$profile_json")
-    ((${#values[@]} >= 4)) || exit 2
-    MODEL_DIR="${values[0]}"
-    env_count="${values[3]}"
-    profile_environment=("${values[@]:4:env_count}")
 else
-    MODEL_DIR="${MODEL_DIR:?请设置 MODEL_DIR 为宿主机模型目录，或选择命名配置并设置 MODEL_ROOT}"
+    echo '请指定 configs/serve 下的配置名；用 --list-configs 查看。' >&2; exit 2
 fi
+mapfile -d '' -t values < <(python3 "$SCRIPT_DIR/serve_config.py" unpack <<< "$profile_json")
+((${#values[@]} >= 4)) || exit 2
+MODEL_DIR="${values[0]}"
+env_count="${values[3]}"
+profile_environment=("${values[@]:4:env_count}")
 IMAGE="${IMAGE:-lmsysorg/sglang:latest}"
 GPU="${GPU:-0}"
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
@@ -87,20 +92,11 @@ if [[ -n "$SGLANG_DIR" ]]; then
 else
     docker_args+=(--env SGLANG_DIR=)
 fi
-# 只传用户设置的参数；默认值统一由 serve.sh 决定。
-if [[ -n "$profile_json" ]]; then
-    # 在宿主机解析一次后冻结；容器不再次读取可变配置或宿主机环境变量。
-    for entry in "${profile_environment[@]}"; do docker_args+=(--env "$entry"); done
-    command=(bash /experiment/serve.sh --exec --resolved-profile "/results/$RUN_ID/profile-resolution.json")
-else
-    for key in HOST PORT TP EP CHUNKED_PREFILL_SIZE DTYPE KV_DTYPE CONTEXT_LENGTH MAX_TOTAL_TOKENS MEM_FRACTION \
-        HICACHE HICACHE_SIZE FORWARD_TIMING HF_HUB_OFFLINE TRANSFORMERS_OFFLINE; do
-        [[ ! -v "$key" ]] || docker_args+=(--env "$key=${!key}")
-    done
-    command=(bash /experiment/serve.sh --exec "$@")
-fi
+# 宿主机解析一次，容器直接执行冻结配置，不再读取外部环境覆盖。
+for entry in "${profile_environment[@]}"; do docker_args+=(--env "$entry"); done
+command=(bash /experiment/serve.sh --exec --resolved-profile "/results/$RUN_ID/profile-resolution.json")
 if "$dry_run"; then
-    [[ -z "$profile_json" ]] || python3 "$SCRIPT_DIR/serve_config.py" preview <<< "$profile_json"
+    python3 "$SCRIPT_DIR/serve_config.py" preview <<< "$profile_json"
     printf '%q ' "${docker_args[@]}" "$IMAGE" "${command[@]}"
     printf '\n'
     exit 0
@@ -114,11 +110,9 @@ mkdir -p "$RESULTS_DIR"
 run_dir="$RESULTS_DIR/$RUN_ID"
 mkdir "$run_dir"
 # 在宿主机写记录，保留 NFS root-squash 下的普通用户写入能力。
-metadata_args=()
-[[ -z "$profile_json" ]] || metadata_args+=(--profile-json "$profile_json")
 python3 "$SCRIPT_DIR/launch_metadata.py" --directory "$run_dir" --runtime docker \
     --model-dir "$MODEL_DIR" --source-dir "$SGLANG_DIR" --gpu "$GPU" \
-    --image-id "$image_id" --image-ref "$IMAGE" "${metadata_args[@]}" \
+    --image-id "$image_id" --image-ref "$IMAGE" --profile-json "$profile_json" \
     -- "${docker_args[@]}" "$image_id" "${command[@]}"
 container_id=""
 cleanup() {

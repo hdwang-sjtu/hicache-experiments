@@ -69,12 +69,18 @@ def record(args):
             key: profile[key] for key in ("name", "source_path", "source_sha256", "environment", "cli_args")
         }
         metadata["profile"]["server_config_sha256"] = hashlib.sha256(profile["server_yaml"].encode()).hexdigest()
-    snapshot = directory / "launch-source"
-    snapshot.mkdir()
+    # 总控已把所有脚本冻结在同一结果包的 code/；独立启动才复制 launch-source/。
+    # 路径相对 launch.json 保存，整个结果目录换机器后仍可追溯到源码。
+    managed = Path(__file__).resolve().parent == directory.resolve().parent / "code"
+    snapshot = directory.parent / "code" if managed else directory / "launch-source"
+    if not managed:
+        snapshot.mkdir()
+    metadata["launcher_source"] = os.path.relpath(snapshot, directory)
     metadata["launcher_sha256"] = {}
     for name in ("serve.sh", "launch_server.sh", "launch_metadata.py", "serve_config.py", "prepare_runtime.py"):
         path = Path(__file__).with_name(name)
-        shutil.copyfile(path, snapshot / name)
+        if not managed:
+            shutil.copyfile(path, snapshot / name)
         metadata["launcher_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
     (directory / "launch.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
     try:

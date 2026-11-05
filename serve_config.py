@@ -12,7 +12,7 @@ import sys
 from prepare_runtime import docker_model_mount
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs/serve"
-# 兼容原来的显式环境变量；没有设置的变量不产生默认值，不覆盖 YAML。
+# 环境变量只做显式覆盖；服务默认值只有 YAML 一处来源。
 ENV_OPTIONS = {
     "HOST": ("host", str), "PORT": ("port", int), "TP": ("tp-size", int), "EP": ("ep-size", int),
     "CHUNKED_PREFILL_SIZE": ("chunked-prefill-size", int),

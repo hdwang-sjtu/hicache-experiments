@@ -5,11 +5,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if [[ ${1:-} == --help ]]; then
     cat <<'HELP'
-用法：bash serve.sh [配置名] [--dry-run] [SGLang 参数 ...]
+用法：bash serve.sh <配置名> [--dry-run] [SGLang 参数 ...]
   bash serve.sh --list-configs
   MODEL_ROOT=/models bash serve.sh qwen3-8b-4k
   MODEL_ROOT=/models bash serve.sh qwen3-8b-4k --mem-fraction-static 0.85
-无配置名时兼容旧调用：MODEL_DIR=/path/to/model HICACHE=1 bash serve.sh。
+必须选择配置名；服务默认值统一保存在 configs/serve/。
 
 命名配置位于 configs/serve/<名称>.yaml；CLI > 显式环境变量 > 文件。
   MODEL_ROOT / MODEL_DIR     模型根目录 / 完整模型目录覆盖；--model-path 优先级更高
@@ -19,9 +19,8 @@ if [[ ${1:-} == --help ]]; then
   RESULTS_DIR / RUN_ID        启动记录根目录 / 单层目录名，默认项目 results / UTC 时间
 服务环境变量仍支持 HOST、PORT、TP、EP、CHUNKED_PREFILL_SIZE、DTYPE、KV_DTYPE、CONTEXT_LENGTH、MAX_TOTAL_TOKENS、
 MEM_FRACTION、HICACHE、HICACHE_SIZE、FORWARD_TIMING。
-旧模式默认上下文 40960、KV 池 36864、BF16、TP=1、显存比例 0.7、HiCache/计时关闭。
 --dry-run 不访问模型或 GPU，不写结果；命名配置解析仅需要 PyYAML。
-内部选项 --exec / --resolved-profile：由 Docker 包装保存记录并传入已解析配置。
+内部选项 --exec / --resolved-profile：总控或 Docker 传入已解析配置，避免重复覆盖。
 HELP
     exit 0
 fi
@@ -51,54 +50,31 @@ RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results}"
 run_dir="$RESULTS_DIR/$RUN_ID"
 profile_json=""
 if [[ -n "$resolved_profile" ]]; then
-    if "$record" || [[ -n "$profile" || $# != 0 ]]; then
-        echo '--resolved-profile 仅供 --exec 使用，不能再追加参数。' >&2; exit 2
+    if [[ -n "$profile" || $# != 0 ]]; then
+        echo '已解析配置不能再追加配置名或参数。' >&2; exit 2
     fi
     profile_json="$(cat "$resolved_profile")"
-    profile_config_file="$(dirname "$resolved_profile")/server-config.yaml"
+    if "$record"; then
+        profile_config_file="$run_dir/server-config.yaml"
+    else
+        profile_config_file="$(dirname "$resolved_profile")/server-config.yaml"
+    fi
 elif [[ -n "$profile" ]]; then
     "$record" || { echo '--exec 命名模式需要 Docker 提供已解析配置。' >&2; exit 2; }
     profile_json="$("$PYTHON_BIN" "$SCRIPT_DIR/serve_config.py" resolve --runtime native "$profile" -- "$@")"
     profile_config_file="$run_dir/server-config.yaml"
-fi
-if [[ -n "$profile_json" ]]; then
-    # NUL 分隔保留空格、换行和 JSON；不 eval，也不 source YAML 内容。
-    mapfile -d '' -t values < <("$PYTHON_BIN" "$SCRIPT_DIR/serve_config.py" unpack <<< "$profile_json")
-    ((${#values[@]} >= 4)) || exit 2
-    MODEL_DIR="${values[1]}"
-    env_count="${values[3]}"
-    runtime_env=("${values[@]:4:env_count}")
-    profile_cli=("${values[@]:4+env_count}")
-    server_args=("$PYTHON_BIN" -m sglang.launch_server --config "$profile_config_file" "${profile_cli[@]}")
 else
-    # 无配置名保留旧默认值；这些值绝不追加到命名配置上。
-    MODEL_DIR="${MODEL_DIR:?请设置 MODEL_DIR 为模型目录，或选择命名配置并设置 MODEL_ROOT}"
-    HICACHE="${HICACHE:-0}"
-    FORWARD_TIMING="${FORWARD_TIMING:-0}"
-    [[ "$HICACHE" =~ ^[01]$ && "$FORWARD_TIMING" =~ ^[01]$ ]] || {
-        echo 'HICACHE 和 FORWARD_TIMING 必须为 0 或 1。' >&2; exit 2;
-    }
-    if [[ "$FORWARD_TIMING" == 1 && "$HICACHE" != 1 ]]; then
-        echo 'FORWARD_TIMING=1 需要 HICACHE=1，以便测量前后确认服务空闲。' >&2; exit 2
-    fi
-    runtime_env=("HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}" "TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}"
-        "SGLANG_ENABLE_METRICS_DEVICE_TIMER=$FORWARD_TIMING")
-    [[ "$HICACHE" == 0 ]] || runtime_env+=("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python")
-    server_args=("$PYTHON_BIN" -m sglang.launch_server
-        --model-path "$MODEL_DIR" --host "${HOST:-127.0.0.1}" --port "${PORT:-39081}"
-        --tp-size "${TP:-1}" --ep-size "${EP:-1}" --dtype "${DTYPE:-bfloat16}" --kv-cache-dtype "${KV_DTYPE:-bfloat16}"
-        --context-length "${CONTEXT_LENGTH:-40960}" --max-total-tokens "${MAX_TOTAL_TOKENS:-36864}"
-        --mem-fraction-static "${MEM_FRACTION:-0.7}"
-        --max-running-requests 1 --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:-4096}" --page-size 1
-        --enable-metrics --return-output-ids
-        --cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled)
-    if [[ "$HICACHE" == 1 ]]; then
-        server_args+=(--enable-hierarchical-cache --enable-hicache-experiment
-            --hicache-host-memory-mode cache --hicache-write-policy write_through
-            --hicache-size "${HICACHE_SIZE:-8}" --hicache-io-backend kernel --hicache-mem-layout page_first)
-    fi
-    server_args+=("$@")
+    echo '请指定 configs/serve 下的配置名；用 --list-configs 查看。' >&2; exit 2
 fi
+# 配置已完整解析；这里只把数据转成参数数组，不维护另一套服务默认值。
+# NUL 分隔保留空格、换行和 JSON；不 eval，也不 source YAML 内容。
+mapfile -d '' -t values < <("$PYTHON_BIN" "$SCRIPT_DIR/serve_config.py" unpack <<< "$profile_json")
+((${#values[@]} >= 4)) || exit 2
+MODEL_DIR="${values[1]}"
+env_count="${values[3]}"
+runtime_env=("${values[@]:4:env_count}")
+profile_cli=("${values[@]:4+env_count}")
+server_args=("$PYTHON_BIN" -m sglang.launch_server --config "$profile_config_file" "${profile_cli[@]}")
 # 显式空字符串使用安装包；仅未设置时自动寻找相邻源码。
 if [[ ! -v SGLANG_DIR ]]; then
     SGLANG_DIR=""
@@ -113,7 +89,7 @@ if [[ -n "$SGLANG_DIR" ]]; then
 fi
 [[ -z ${GPU:-} ]] || runtime_env+=("CUDA_VISIBLE_DEVICES=$GPU")
 if "$dry_run"; then
-    [[ -z "$profile_json" ]] || "$PYTHON_BIN" "$SCRIPT_DIR/serve_config.py" preview <<< "$profile_json"
+    "$PYTHON_BIN" "$SCRIPT_DIR/serve_config.py" preview <<< "$profile_json"
     printf '%q ' env "${runtime_env[@]}" "${server_args[@]}"
     printf '\n'
     exit 0
@@ -123,12 +99,10 @@ export "${runtime_env[@]}"
 if "$record"; then
     mkdir -p "$RESULTS_DIR"
     mkdir "$run_dir" # 不覆盖已有启动记录。
-    metadata_args=()
-    [[ -z "$profile_json" ]] || metadata_args+=(--profile-json "$profile_json")
     "$PYTHON_BIN" "$SCRIPT_DIR/launch_metadata.py" \
         --directory "$run_dir" --runtime native --model-dir "$MODEL_DIR" \
         --source-dir "$SGLANG_DIR" --gpu "${CUDA_VISIBLE_DEVICES:-inherited}" \
-        "${metadata_args[@]}" -- "${server_args[@]}"
+        --profile-json "$profile_json" -- "${server_args[@]}"
     echo "启动记录：$run_dir；客户端可用 --server-artifacts 指向该目录或其本地副本。"
     # exec 保留服务退出码和信号语义；长期任务请在 tmux 等会话中启动。
     exec "${server_args[@]}" > >(tee "$run_dir/server.log") 2>&1

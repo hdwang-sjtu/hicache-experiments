@@ -30,7 +30,8 @@ import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 mode=os.environ['TEST_MODE']
 if mode=='crash': sys.exit(7)
-identity=sys.argv[sys.argv.index('--served-model-name')+1]
+resolution=json.load(open(sys.argv[sys.argv.index('--resolved-profile')+1]))
+identity=resolution['cli_args'][1]
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*_): pass
     def do_GET(self):
@@ -44,6 +45,7 @@ CHILD
 
 class StubJob(Job):
     def prepare(self):
+        self.model = self.project / 'mock-model'
         self.phase('preparing_model')
         if self.env['TEST_MODE']=='download-fail':
             raise RuntimeError('simulated download failure')
