@@ -104,7 +104,7 @@ MODEL_DIR=/path/to/Qwen3-8B SGLANG_DIR=/path/to/sglang GPU=0 \
 ```
 
 容器内 `/model`、`/experiment`、可选的 `/sgl-workspace/sglang` 只读；`/results` 可写。
-使用 HF 缓存中的完整快照路径作为 `MODEL_DIR` 时，模型仓库连同 `blobs/` 挂载到 `/model`，服务路径为 `/model/snapshots/<revision>/`。
+使用 HF 缓存中的完整快照路径作为 `MODEL_DIR` 时，所属 HF 缓存根目录挂载到 `/model`，服务路径为 `/model/models--<组织>--<模型>/snapshots/<revision>/`。这同时保留仓库内 `blobs/` 和新版 HF 缓存根目录共享 `blobs/` 的软链接；已有缓存可直接复用。
 Docker 入口解析并冻结命名配置，再调用 `serve.sh --exec`。总控提供已解析配置时直接执行。
 手工启动须指定配置名；额外参数通过 Bash 数组传递，JSON 和带空格的路径保持完整。
 `GPU` 只用于 Docker 设备选择，不把宿主机编号再次传为容器 CUDA 编号。

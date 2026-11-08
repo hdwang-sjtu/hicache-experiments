@@ -65,7 +65,7 @@
 
 独立启动时，两种入口都使用 `serve_config.py`，遵循 **命令行 > 显式环境变量 > 配置文件**。
 native 由 `serve.sh` 解析配置，再调用 `launch_metadata.py` 写记录，最后执行 SGLang。
-Docker 由宿主机上的 `launch_server.sh` 解析模型路径并将容器路径改为 `/model`（HF 快照为 `/model/snapshots/<revision>/`），调用同一记录工具保存配置，再将冻结的 `profile-resolution.json` 交给容器内的 `serve.sh --exec --resolved-profile`。
+Docker 由宿主机上的 `launch_server.sh` 解析模型路径并将容器路径改为 `/model`（HF 快照挂载所属缓存根，路径为 `/model/models--<组织>--<模型>/snapshots/<revision>/`，保留共享 blobs），调用同一记录工具保存配置，再将冻结的 `profile-resolution.json` 交给容器内的 `serve.sh --exec --resolved-profile`。
 容器内仅解包已解析配置，不重新读取原始 YAML，也不重复生成启动记录。
 
 命名启动保存的 `profile.yaml` 是原文，`server-config.yaml` 是环境覆盖后的下发配置，`profile-resolution.json` 保存路径、环境和 CLI 信息；CLI 仍可覆盖下发 YAML。

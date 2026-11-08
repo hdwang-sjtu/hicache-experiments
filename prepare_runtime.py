@@ -88,7 +88,7 @@ def prepare_source(cache, lock, patch):
 
 
 def model_storage_root(directory):
-    """HF 快照的文件可以链接到同仓库 blobs，Docker 须保留这层布局。"""
+    """识别快照所属模型仓库，用于版本检查和缺失文件补齐。"""
     directory = Path(directory).expanduser().resolve()
     if directory.parent.name == "snapshots" and directory.parent.parent.name.startswith("models--"):
         return directory.parent.parent
@@ -98,6 +98,10 @@ def model_storage_root(directory):
 def docker_model_mount(directory):
     directory = Path(directory).expanduser().resolve()
     storage = model_storage_root(directory)
+    if storage != directory:
+        # HF 新布局可从仓库 blobs 再链接到缓存根的共享 blobs。
+        # 挂载缓存根保留整条相对链接；普通模型目录仍只挂载自身。
+        storage = storage.parent
     return str(storage), str(Path("/model") / directory.relative_to(storage))
 
 
@@ -105,6 +109,11 @@ def model_inventory(directory):
     """检查 HF 模型的配置、tokenizer、权重及全部分片，不能只看 config.json。"""
     directory = Path(directory).resolve()
     storage = model_storage_root(directory)
+    weight_roots = [directory]
+    if storage != directory:
+        # 允许所属仓库的旧 blobs 和同一 HF 缓存的共享 blobs。
+        # 检查最终目标，避免链接借共享目录再次跳到无关外部路径。
+        weight_roots += [storage / "blobs", storage.parent / "blobs"]
     config = directory / "config.json"
     if not config.is_file():
         raise FileNotFoundError("模型缺少 config.json")
@@ -130,9 +139,7 @@ def model_inventory(directory):
         raise FileNotFoundError("模型没有 safetensors/bin 权重或分片索引")
     for name in weights:
         path = (directory / name).resolve()
-        allowed = path.is_relative_to(directory) or (
-            storage != directory and path.is_relative_to(storage / "blobs"))
-        if not allowed:
+        if not any(path.is_relative_to(root) for root in weight_roots):
             raise ValueError(f"模型权重分片位于目录外：{name}")
         if not path.is_file():
             raise FileNotFoundError(f"模型缺少权重分片：{name}")

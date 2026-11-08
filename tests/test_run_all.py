@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -179,7 +180,7 @@ class ModelPreparation(unittest.TestCase):
             if not (directory/name).is_file():
                 (directory/name).write_bytes(data)
 
-    def snapshot(self, cache):
+    def snapshot(self, cache, shared=()):
         repository = cache/'models--org--model'
         snapshot = repository/'snapshots'/self.revision
         blobs = repository/'blobs'
@@ -187,6 +188,14 @@ class ModelPreparation(unittest.TestCase):
         snapshot.mkdir(parents=True)
         for file in blobs.iterdir():
             (snapshot/file.name).symlink_to('../../blobs/' + file.name)
+        for name in shared:
+            blob = blobs/name
+            digest = hashlib.sha256(blob.read_bytes()).hexdigest()
+            payload = cache/'blobs'/digest[:2]/digest
+            payload.parent.mkdir(parents=True, exist_ok=True)
+            (cache/'blobs/.huggingface-shared-blobs').write_text('1')
+            blob.rename(payload)
+            blob.symlink_to(os.path.relpath(payload, blob.parent))
         return snapshot
 
     def test_only_explicit_model_directory_is_resolved_before_preparation(self):
@@ -299,20 +308,73 @@ class ModelPreparation(unittest.TestCase):
             (local/file.name).symlink_to(file.resolve())
         with self.assertRaises(ValueError): inspect_model(local)
 
+    def test_shared_and_mixed_snapshots_reuse_files_and_keep_docker_links(self):
+        for shared in (('part1.safetensors',), ('part1.safetensors', 'part2.safetensors')):
+            with self.subTest(shared=shared):
+                cache = self.root/str(len(shared))/'hub'
+                snapshot = self.snapshot(cache, shared=shared)
+                before = {p: (p.stat().st_ino, p.stat().st_mtime_ns)
+                          for p in cache.rglob('*') if p.is_file()}
+                with patch('huggingface_hub.snapshot_download') as download:
+                    info = prepare_model('org/model', self.revision, snapshot)
+                download.assert_not_called()
+                self.assertEqual(info['revision'], self.revision)
+                self.assertEqual(before, {p: (p.stat().st_ino, p.stat().st_mtime_ns)
+                                         for p in cache.rglob('*') if p.is_file()})
+                host, container = docker_model_mount(snapshot)
+                self.assertEqual(host, str(cache))
+                # 用独立目录模拟挂载后的文件系统；遗漏共享 blobs 会形成断链。
+                mounted = self.root/str(len(shared))/'container/model'
+                shutil.copytree(host, mounted, symlinks=True)
+                model = mounted/Path(container).relative_to('/model')
+                self.assertEqual(inspect_model(model)['weight_bytes'], info['weight_bytes'])
+                for file in snapshot.iterdir():
+                    self.assertEqual((model/file.name).read_bytes(), file.read_bytes())
+
+    def test_shared_blob_missing_file_is_repaired_in_same_cache(self):
+        cache = self.root/'hub'
+        snapshot = self.snapshot(cache, shared=('part2.safetensors',))
+        payload = (snapshot/'part2.safetensors').resolve()
+        data = payload.read_bytes()
+        payload.unlink()
+        def download(**kwargs):
+            self.assertEqual(kwargs, dict(repo_id='org/model', revision=self.revision, cache_dir=str(cache)))
+            payload.write_bytes(data)
+            return str(snapshot)
+        info = prepare_model('org/model', self.revision, snapshot, download)
+        self.assertTrue(info['download_requested'])
+        self.assertTrue((snapshot/'part2.safetensors').is_symlink())
+
+    def test_shared_blobs_cannot_escape_to_other_repositories_or_external_files(self):
+        cache = self.root/'hub'
+        snapshot = self.snapshot(cache, shared=('part1.safetensors',))
+        payload = (snapshot/'part1.safetensors').resolve()
+        data = payload.read_bytes()
+        for outside in (self.root/'external.safetensors',
+                        cache/'models--org--other/blobs/part1.safetensors'):
+            with self.subTest(outside=outside):
+                outside.parent.mkdir(parents=True, exist_ok=True)
+                outside.write_bytes(data)
+                payload.unlink()
+                payload.symlink_to(outside)
+                with self.assertRaisesRegex(ValueError, '目录外'):
+                    inspect_model(snapshot)
+
     def test_real_hf_offline_cache_respects_standard_environment_variables(self):
-        base = self.root/'cache'
-        cache = base/'hub'
-        snapshot = self.snapshot(cache)
         clean_env = {k: v for k, v in os.environ.items() if k not in ('HF_HOME', 'HF_HUB_CACHE', 'HUGGINGFACE_HUB_CACHE', 'XDG_CACHE_HOME')}
-        for override in ({'HF_HOME': str(base)}, {'HF_HUB_CACHE': str(cache), 'HF_HOME': str(self.root/'other')}):
-            with self.subTest(override=override):
-                output = self.root/'model.json'
-                result = subprocess.run([sys.executable, str(PROJECT/'prepare_runtime.py'), 'model',
-                                         '--repo', 'org/model', '--revision', self.revision, '--output', str(output)],
-                                        env={**clean_env, **override, 'HF_HUB_OFFLINE': '1'},
-                                        capture_output=True, text=True, timeout=15)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(output.read_text())['path'], str(snapshot))
+        for shared in ((), ('part1.safetensors', 'part2.safetensors')):
+            base = self.root/('shared' if shared else 'legacy')
+            cache = base/'hub'
+            snapshot = self.snapshot(cache, shared=shared)
+            for override in ({'HF_HOME': str(base)}, {'HF_HUB_CACHE': str(cache), 'HF_HOME': str(self.root/'other')}):
+                with self.subTest(shared=shared, override=override):
+                    output = self.root/'model.json'
+                    result = subprocess.run([sys.executable, str(PROJECT/'prepare_runtime.py'), 'model',
+                                             '--repo', 'org/model', '--revision', self.revision, '--output', str(output)],
+                                            env={**clean_env, **override, 'HF_HUB_OFFLINE': '1'},
+                                            capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(output.read_text())['path'], str(snapshot))
 
 
 if __name__=='__main__': unittest.main()

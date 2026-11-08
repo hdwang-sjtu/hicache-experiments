@@ -66,7 +66,7 @@ fi
 [[ "$MODEL_DIR" == /* ]] || MODEL_DIR="$PWD/$MODEL_DIR"
 [[ "$RESULTS_DIR" == /* ]] || RESULTS_DIR="$PWD/$RESULTS_DIR"
 if [[ -n "$SGLANG_DIR" && "$SGLANG_DIR" != /* ]]; then SGLANG_DIR="$PWD/$SGLANG_DIR"; fi
-# HF snapshots 中的相对软链接需要同仓库 blobs；普通模型目录仍直接挂载。
+# HF 快照挂载所属缓存根，保留仓库/共享 blobs 链接；普通模型目录仍直接挂载。
 mapfile -d '' -t model_mount < <(python3 "$SCRIPT_DIR/serve_config.py" model-mount "$MODEL_DIR")
 ((${#model_mount[@]} == 2)) || exit 2
 # host 网络保留 loopback 控制接口语义；远程客户端通过 SSH 隧道访问。

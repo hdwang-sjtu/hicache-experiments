@@ -174,28 +174,34 @@ elif command[0] == 'wait': print('17')
 
     def test_docker_hf_snapshot_keeps_blobs_and_config_paths(self):
         revision = 'd'*40
-        repository = self.root/'hub/models--org--model'
-        snapshot = repository/'snapshots'/revision
-        blobs = repository/'blobs'
-        snapshot.mkdir(parents=True)
-        blobs.mkdir()
-        (blobs/'config').write_text('{}')
-        (snapshot/'config.json').symlink_to('../../blobs/config')
-        for profile in ('qwen3-8b-4k',):
-            with self.subTest(profile=profile):
-                run_id = 'hf-named' if profile else 'hf-generic'
+        for shared in (False, True):
+            with self.subTest(shared=shared):
+                cache = self.root/('shared' if shared else 'legacy')/'hub'
+                repository = cache/'models--org--model'
+                snapshot = repository/'snapshots'/revision
+                blobs = repository/'blobs'
+                snapshot.mkdir(parents=True)
+                blobs.mkdir()
+                (blobs/'config').write_text('{}')
+                (snapshot/'config.json').symlink_to('../../blobs/config')
+                if shared:
+                    payload = cache/'blobs/aa'/('a'*64)
+                    payload.parent.mkdir(parents=True)
+                    (blobs/'config').rename(payload)
+                    (blobs/'config').symlink_to(os.path.relpath(payload, blobs))
+                run_id = 'hf-shared' if shared else 'hf-legacy'
                 self.fake_docker()
                 log = self.root/(run_id + '.jsonl')
-                result = self.run_script('launch_server.sh', *([profile] if profile else []),
+                result = self.run_script('launch_server.sh', 'qwen3-8b-4k',
                                          MODEL_DIR=str(snapshot), RUN_ID=run_id, FAKE_DOCKER_LOG=str(log))
                 self.assertEqual(result.returncode, 17, result.stderr)
                 calls = [json.loads(line) for line in log.read_text().splitlines()]
                 command = next(call for call in calls if call[0] == 'run')
-                self.assertIn(f'type=bind,src={repository},dst=/model,readonly', command)
-                self.assertIn(f'MODEL_DIR=/model/snapshots/{revision}', command)
-                if profile:
-                    resolution = json.loads((self.root/f'results/{run_id}/profile-resolution.json').read_text())
-                    self.assertEqual(resolution['server']['model-path'], f'/model/snapshots/{revision}')
+                model_path = f'/model/{repository.name}/snapshots/{revision}'
+                self.assertIn(f'type=bind,src={cache},dst=/model,readonly', command)
+                self.assertIn(f'MODEL_DIR={model_path}', command)
+                resolution = json.loads((self.root/f'results/{run_id}/profile-resolution.json').read_text())
+                self.assertEqual(resolution['server']['model-path'], model_path)
 
 
 class RemoteClient(unittest.TestCase):
