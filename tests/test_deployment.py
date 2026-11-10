@@ -284,7 +284,7 @@ class AutoTokenizer:
             "--base-url", f"http://127.0.0.1:{self.server.server_port}",
             "--tokenizer", str(self.root), "--output-dir", str(self.root / "results"),
             "--prefix-lengths", "8", "16", "--suffix-lengths", "2", "4",
-            "--groups", "cold", "l1", "--repeats", "2", "--no-plot", *extra,
+            "--groups", "cold", "l1", "--repeats", "2", "--no-plot", "--no-prefix-reuse", *extra,
         ], env=env, capture_output=True, text=True, timeout=15)
 
     def test_standalone_http_matrix_without_server_files(self):

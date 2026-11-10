@@ -17,10 +17,11 @@
 ```text
 main()                       解析 run / analyze 等子命令
 └── run()                    准备目录和输入，等待并检查服务，保存最终状态
-    ├── make_cases()         构造精确 P、S，单独准备 P
+    ├── make_cases()         构造精确 P、S 和请求哈希
     ├── check_server()       检查 TP/EP、单请求、上下文长度和 KV 容量
-    ├── run_samples()        执行运行预热，收集每组所需的有效测量
-    │   └── execute_sample() 清空缓存 → 按组准备 → 测量 → 校验
+    ├── run_samples()        每个 P 先做 cold/reference，再准备 P 并跨 S 采样
+    │   ├── prepare_prefix() 清空 → 计算 P → 等备份并记录池占用基线
+    │   └── execute_sample() 检查/降级 P → 测量 → 校验并检查状态回收
     │       ├── Client      发送 HTTP 请求并保存原始响应
     │       └── validate()  检查长度、各层命中、回撤和时间字段
     └── hicache.results  过滤无效样本，输出 Median、P95 和图表
@@ -28,7 +29,7 @@ main()                       解析 run / analyze 等子命令
 
 `hicache/metrics.py` 集中处理所有 rank 的指标；`tools/diagnostics.py` 保存可选遥测和 trace 分析。模拟测试集中在 `tests/`，运行 `python3 -m unittest discover -s tests`。
 
-有两种容易混淆的“预热”：`warmup` 是每个长度组合开始时的运行预热，不写入测量 CSV；`prepare` 是每一次 L1 样本都必须重新做的 P 请求，用来构造缓存状态。
+有两种容易混淆的“预热”：`warmup` 是每个长度组合开始时的运行预热，不写入测量 CSV；`prepare` 是建立 P 检查点的请求，默认每个 P 仅一次，供各 S 和所有重复共用。
 `measure` 才是计入 CSV 的 P+S 请求，且其清空和准备耗时不计入客户端测量延迟。
 
 函数说明、关键流程和命令行帮助使用中文。变量、CSV 字段和图表标签保留英文；内置测试语料也保持原文，以免修改注释时改变输入。
@@ -81,13 +82,13 @@ JSON/IPC 传入的 token IDs 是 `list`；接口在匹配前转换为 serving �
 - 操作保留 host KV 和索引；GPU allocator 可用槽位增加，但静态 KV 池不会因此从 `nvidia-smi` 消失。
 - 不支持的组件、Rust TreeCore、额外分支或不完整备份都会报错，不能把失败降级成普通请求继续测量。
 
-每个样本的准备如下，均在测量区间外：
+默认先完成同 P 所有 S 的 cold/reference，再准备一次 P。每个样本的控制操作均在测量区间外：
 
 | 组别 | 准备操作 | 测量请求的实际命中要求 |
 |---|---|---|
 | Cold | 清空 → 确认空闲 | device=0，host=0 |
-| L1 | 清空 → P → 等待 CPU 备份完成 | device=P，host=0 |
-| L2 | 清空 → P → 等待备份 → Demote | device=0，host=P |
+| L1 | 检查共享 P 的 KV/GDN 检查点和完整备份 | device=P，host=0 |
+| L2 | 检查共享 P → Demote | device=0，host=P |
 
 注意：L1 的 CPU **备份覆盖**也等于 P，但请求实际 **host 命中**为 0，因为 GPU 已有副本。脚本分别记录这两个量。
 
@@ -217,13 +218,17 @@ Driver 本身不负责后台作业编排。`run_all.py` 管理整轮服务和测
 默认把脚本内固定的英文实验笔记分词后重复、截取到精确长度。这是合成性能输入，不用于评价模型回答质量。
 可以用 `--text-file /path/to/text.txt` 指定固定 UTF-8 文本；特殊 token 不允许进入测试文本。
 
-每个 P/S 组合先对所选组各执行一次运行预热，不计入 CSV。每次测量分别执行：
+默认按用户给定的 P 顺序分段，每个 P 的流程是：
 
-1. Cold：确认缓存清空成功 → 发送 P+S。
-2. L1：确认缓存清空成功 → 发送 P 生成 1 token → 发送相同测量输入 P+S。
+1. 先逐个 S 完成 cold 预热和正式样本，保存各点的参考输出。未选择 cold 组时，改为逐点执行一次 cold reference，不写入 CSV。
+2. 清空缓存，单独发送 P 生成一个 token，等 P 的 KV/GDN 及 CPU 备份完整，记录所有 rank 的池占用基线。
+3. 逐个 S 完成 L1/L2 运行预热和全部正式重复；两组同时存在时每轮打乱先后顺序（种子可复现）。
 
-准备请求只处理 P。每次重复都清空后重新准备，避免上次的 S 也被缓存。
-每轮随机化组顺序（种子可复现），单请求串行执行。
+命中请求发送相同 P+S，并设置实验参数 skip_radix_cache_insert=true。它仍分配计算 S 所需的临时 KV/GDN，但既不提交中间 checkpoint，也不在结束时把新增状态写入共享缓存。原有 P 保持不变，GDN 使用 serving 原有的请求私有副本。
+
+每次结束后，完整 P+S 必须只能匹配到 P，所有 rank 的 KV/GDN 槽位必须回到该 P 的基线。污染或泄漏会保存无效样本并停止，避免带病继续复用。cold/reference 仍完整计算 P+S；省掉的是重复准备 P 的请求。
+
+--no-prefix-reuse 恢复逐样本清空和准备，YAML 可写 test.prefix-reuse: false。复用需要支持此请求选项的 HiCache 实验服务；旧服务或关闭 HiCache 时应显式关闭复用。
 
 有效样本必须满足：
 
@@ -255,6 +260,7 @@ Driver 本身不负责后台作业编排。`run_all.py` 管理整轮服务和测
 | `kv_load_ops` | 本次请求完成并带有 CUDA Event 时间的 H2D 操作数 |
 | `prefill_forward_gpu_ms` | 可选；原生 extend CUDA Event 累计指标的请求前后差值。Cold 累加全部 chunk；L1/L2 只计算 S，但 L2 区间可能等待 KV |
 | `device_tokens_before` / `host_backed_tokens_before` | 准备结束后，目标 P 在 GPU 上的命中 / CPU 上的备份覆盖 |
+| `prefix_reuse` | 本行是否使用共享 P 且禁止提交新增缓存；cold 为 False，整体开关另见 config.json |
 | `device_used_tokens_before/after` / `host_used_tokens_before/after` | 请求前后，缓存池中已用的 token 槽位数，不是 CUDA allocator 占用字节数 |
 
 HiCache 模式下，接口先确认空闲，脚本再读取 `/metrics` 基准；测量请求结束后等 ACK 被处理，再读取终值。两个指标快照之间没有 flush，也不包含其他测量请求。
@@ -275,7 +281,7 @@ Median 和 P95 仅对有效样本计算；P95 使用排序后线性插值。少�
 - `launch.json`、可选 `sglang.patch`、`gpu.txt`、`server.log`：保存在启动目录；用 `--server-artifacts` 可关联其客户端副本。native 无镜像 ID，未识别 Git checkout 时无源码提交号。
 - 命名模式额外保存 `profile.yaml`、`server-config.yaml`、`profile-resolution.json`，记录原文、环境覆盖及 CLI；`launch.json` 保存配置名和哈希。
 - `config.json`：Driver 参数、状态、实际 `/server_info`、模型信息、客户端依赖版本、tokenizer 哈希。
-- `inputs.json`：固定文本、精确 prefix / suffix / 预热 suffix IDs 和测量输入哈希。
+- `inputs.json`：固定文本、可重建 prefix/suffix 的 token 基序列、各点长度及测量输入哈希。
 - `responses.jsonl`：控制操作、预热和测量的原始响应，阶段分别标记；成功的 `/metrics` 响应只在内存中解析，不逐次归档全文，查询失败仍记录错误。
 - `rank-metrics.jsonl`：GPU timing 任务保存各请求逐 rank 的指标起点、终点与差值，用于复核计时和缓存命中。
 - `samples.csv`：每个测量样本及有效性；`summary.csv`：有效样本 Median / P95 和无效计数。

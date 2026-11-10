@@ -29,7 +29,9 @@ Qwen3.5 混合注意力需要同时恢复完整 P 的全注意力 KV 与 GDN 线
 
 P 按 256 对齐，chunk 为 256 的正整数倍；服务实际 checkpoint 网格还会由 Driver 检查。L1/L2 的 S 不超过固定 chunk，保证一次测量 forward。上下文和实际 KV 容量至少为最大 P+S+1。
 
-每个样本先清空缓存；L1/L2 单独准备 P，再发送相同的 P+S。L2 在 CPU 备份完成后定向逐出 GPU，验收 KV 与 GDN 的实际恢复量。
+默认每个 P 先完成各 S 的 cold/reference，再清空并单独准备一次 P，供所有 S 的预热和重复共用。命中请求设置 skip_radix_cache_insert：仍读取 P，并把 GDN 状态复制到请求自己的槽位；S 的 KV 和更新后的 GDN 状态只在本请求内使用，结束后释放。L2 每次在备份完成后定向逐出 GPU，验收 KV 与 GDN 的实际恢复量。
+
+每个 rank 都核对 P 检查点、完整 P+S 只能匹配到 P，以及请求结束后 KV/GDN 槽位回到同一个 P 的基线。失败终止采样。--no-prefix-reuse 恢复逐样本清空和准备；YAML 使用 test.prefix-reuse: false。
 
 ## Prefill CUDA Graph
 
@@ -43,7 +45,7 @@ round-robin 按本次 forward 的 token 序号分配专家，包含层与分片�
 
 prefill_forward_gpu_ms 是最慢 rank 的原生 extend CUDA Event 区间，可包含通信、等待和提交间隙，不是所有 kernel 忙碌时间之和。
 
-新结果记录 load_format、routing、prefill_graph 和 Graph/eager 次数。dummy 与真实权重、不同路由和不同 Graph 策略不能无条件合并拟合。旧数据缺少这些标记时保持 unknown。
+新结果记录 load_format、routing、prefill_graph、prefix_reuse 和 Graph/eager 次数。dummy 与真实权重、不同路由和不同 Graph 策略不能无条件合并拟合。复用会改变缓存提交和测量间隔，客户端延迟需结合采样模式比较；旧数据缺少标记时保持 unknown。
 
 历史实际配置、故障与性能见 [实验索引](experiments/README.md)。新模式验收仅证明记录中的硬件、模型、拓扑和配置组合。
 

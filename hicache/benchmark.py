@@ -9,7 +9,7 @@
   analyze    读取已有结果重新汇总，不访问模型或服务器。
 
 约定：P 是可复用的历史前缀长度，S 是本次新增输入长度。
-Cold 不预热；L1/L2 单独发送 P 建立检查点，再发送 P+S。
+Cold 每次清空；L1/L2 默认同 P 共用一次检查点，再发送禁止新增缓存提交的 P+S。
 L2 先确认 CPU 备份完成，再通过实验接口逐出 GPU。
 --gpu-timing 读取原生 CUDA Event 区间；--profile 单独诊断 Kernel 执行与加载重叠。
 """
@@ -200,7 +200,7 @@ class Client:
                 raise TimeoutError("等待缓存备份/恢复结束超时")
             time.sleep(.02)
 
-    def generate(self, ids, output_length, stage):
+    def generate(self, ids, output_length, stage, *, skip_cache_insert=False):
         """直接发送 token IDs，避免聊天模板或重新分词改变精确输入长度。"""
         request_id = "cache-exp-" + uuid.uuid4().hex
         response, elapsed = self.request(
@@ -209,6 +209,7 @@ class Client:
                 rid=request_id,
                 input_ids=ids,
                 stream=False,
+                skip_radix_cache_insert=skip_cache_insert,
                 # 固定输出长度；不因模型提前生成 EOS 而缩短本次请求。
                 sampling_params=dict(
                     temperature=0,
@@ -260,32 +261,67 @@ def validate(response, p, s, output_length, group):
     return errors, details
 
 
-def execute_sample(client, case, group, output_length, stage="measure"):
-    """执行一个完整样本：清空 → 按组准备 → 测量 P+S → 校验并组装 CSV 行。
+def prepare_prefix(client, case):
+    """清空后只计算 P；返回可在多个 S/重复间核对的稳定池占用基线。"""
+    client.flush()
+    p = len(case['prefix'])
+    reader = getattr(client, 'rank_metrics', None)
+    if reader:
+        before = client.wait_cache(case['prefix'])
+        check_state(before, 'cold', p, reader.tp)
+        metrics = reader.snapshot('prepare:metrics_before')
+    result, _, rid = client.generate(case['prefix'], 1, 'prepare')
+    after = None
+    if reader:
+        after = client.wait_cache(case['prefix'])
+        reader.finish(metrics, 'prepare', rid, p=p, s=0, group='cold', state=before)
+        check_state(after, 'l1', p, reader.tp)
+    errors, _ = validate(result, p, 0, 1, 'cold')
+    if errors:
+        raise RuntimeError('Preparation failed: ' + '; '.join(errors))
+    return after
 
-    Cold 直接测量；L1 单独准备 P 的 KV/线性状态，再测量 P+S。
-    清空与准备请求均不计入测量请求的延迟。每次重复都重新准备缓存。
+
+def check_reused_prefix(client, case, after):
+    """检查完整输入也只能命中 P，且请求私有 KV/GDN 槽位已全部归还。
+
+    仅检查 P 的命中会漏掉树上的 S 子节点。池占用对比同一个 P 的初始
+    基线，而非上一个样本，避免每次泄漏少量槽位时累积污染仍被接受。
+    """
+    tp, p = client.rank_metrics.tp, len(case['prefix'])
+    check_state(after, 'l1', p, tp)
+    full = client.wait_cache(case['prefix'] + case['suffix'])
+    baseline = rank_states(client.prefix_state, tp)
+    for rank, state in rank_states(after, tp).items():
+        match = rank_states(full, tp)[rank]
+        if match.get('matched_tokens') != p or match.get('device_tokens') != p:
+            raise RuntimeError(f'rank={rank} P+S 缓存超出或不足 P')
+        keys = ['device_used_tokens', 'host_used_tokens']
+        if 'mamba' in state.get('cache_components', []):
+            keys += ['mamba_device_free', 'mamba_host_free']
+        for key in keys:
+            if key not in state or state[key] != baseline[rank].get(key):
+                raise RuntimeError(f'rank={rank} {key} 未回到 P 基线：'
+                                   f'{state.get(key)} != {baseline[rank].get(key)}')
+
+
+def execute_sample(client, case, group, output_length, stage="measure"):
+    """测量 P+S；复用时只恢复/降级 P，独立模式则逐次清空和准备。
+
+    缓存控制和准备均在计时外。复用请求只读取共享 P，新增状态在结束时
+    释放；线性注意力通过 serving 原有 COW 在请求自己的状态副本上运行。
     """
     p, s = len(case["prefix"]), len(case["suffix"])
     environment = getattr(client, "environment", None)
     if environment is not None:
         environment.wait_ready()
-    client.flush()
     rank_reader = getattr(client, "rank_metrics", None)
-    if group in ("l1", "l2"):
-        # 预热请求本身应是 Cold；准备失败意味着测量起点不可靠，直接终止。
-        if rank_reader:
-            prepare_state = client.wait_cache(case["prefix"])
-            check_state(prepare_state, "cold", p, rank_reader.tp)
-            prepare_metrics = rank_reader.snapshot("prepare:metrics_before")
-        prepared, _, prepare_rid = client.generate(case["prefix"], 1, "prepare")
-        if rank_reader:
-            client.wait_cache(case["prefix"])
-            rank_reader.finish(prepare_metrics, "prepare", prepare_rid,
-                               p=p, s=0, group="cold", state=prepare_state)
-        errors, _ = validate(prepared, p, 0, 1, "cold")
-        if errors:
-            raise RuntimeError("Preparation failed: " + "; ".join(errors))
+    reuse = bool(getattr(client, 'prefix_reuse', False) and group != 'cold')
+    if not reuse:
+        if group == 'cold':
+            client.flush()
+        else:
+            prepare_prefix(client, case)
     before_state = None
     before_metrics = None
     if rank_reader:
@@ -313,9 +349,9 @@ def execute_sample(client, case, group, output_length, stage="measure"):
             detailed_annotations=True,
         ), stage="profile_start", parse_json=False)
     try:
+        kwargs = {'skip_cache_insert': True} if reuse else {}
         result, elapsed, rid = client.generate(
-            case["prefix"] + case["suffix"], output_length, stage
-        )
+            case["prefix"] + case["suffix"], output_length, stage, **kwargs)
         window = dict(getattr(client, "last_request_window", None) or {})
     finally:
         if profiled:
@@ -327,6 +363,11 @@ def execute_sample(client, case, group, output_length, stage="measure"):
         after_state = client.wait_cache(case["prefix"])
         extra = rank_reader.finish(before_metrics, stage, rid,
                                    p=p, s=s, group=group, state=before_state)
+        if reuse:
+            try:
+                check_reused_prefix(client, case, after_state)
+            except RuntimeError as exc:
+                errors.append('[Prefix reuse] ' + str(exc))
         if (stage in ('measure', 'warmup') and getattr(rank_reader, 'gpu_timing', False)
                 and getattr(rank_reader, 'last_deltas', None)):
             error = graph_error(rank_reader.last_deltas, getattr(client, 'prefill_graph', None))
@@ -371,6 +412,7 @@ def execute_sample(client, case, group, output_length, stage="measure"):
         invalid_reason="; ".join(errors),
         output_ids=json.dumps(result.get("output_ids")),
         profiled=profiled,
+        prefix_reuse=reuse,
         cache_valid=cache_valid,
         **window,
         **environment_result,
@@ -436,17 +478,57 @@ def check_server(info, cases, output_length, groups=None):
 
 
 def run_samples(client, cases, args, writer, file, common):
-    """按 P/S 组合采样，直到每组达到指定有效次数，或超过最大尝试次数。"""
+    """每个 P 先做所有 cold，再准备一次 P，跨 S 收集命中样本。
+
+    cold reference 仍计算完整 P+S，只把它集中到准备 P 之前。各 S 的
+    命中预热和重复仍逐点收集；不在网格中全局打乱，也不伪造缓存状态。
+    """
+    client.prefix_reuse = False
+    hits = [g for g in args.groups if g != 'cold']
+    if not getattr(args, 'prefix_reuse', False) or not hits:
+        return _sample_cases(client, cases, args, writer, file, common)
+    reader = getattr(client, 'rank_metrics', None)
+    if not reader or not client.hicache:
+        raise ValueError('前缀复用需要 HiCache 实验接口；使用 --no-prefix-reuse 可逐次准备')
+    state = client.wait_cache(cases[0]['prefix'])
+    if any(v.get('skip_radix_cache_insert') is not True
+           for v in rank_states(state, reader.tp).values()):
+        raise ValueError('服务不支持请求级缓存写入控制；更新补丁或使用 --no-prefix-reuse')
     rng = random.Random(args.seed)
+    for p in dict.fromkeys(len(case['prefix']) for case in cases):
+        batch = [case for case in cases if len(case['prefix']) == p]
+        references = {}
+        if 'cold' in args.groups:
+            cold_args = argparse.Namespace(**{**vars(args), 'groups': ['cold']})
+            _sample_cases(client, batch, cold_args, writer, file, common, references, rng)
+        else:
+            for case in batch:
+                reference = execute_sample(client, case, 'cold', args.output_length, 'reference')
+                if not reference['valid']:
+                    raise RuntimeError('Cold reference failed: ' + reference['invalid_reason'])
+                references[case['id']] = reference['output_ids']
+        client.prefix_state = prepare_prefix(client, batch[0])
+        client.prefix_reuse = True
+        try:
+            hit_args = argparse.Namespace(**{**vars(args), 'groups': hits})
+            _sample_cases(client, batch, hit_args, writer, file, common, references, rng)
+        finally:
+            client.prefix_reuse = False
+
+
+def _sample_cases(client, cases, args, writer, file, common, references=None, rng=None):
+    """一套收集循环供 cold、复用命中和逐次准备共用，避免分叉验证规则。"""
+    references = {} if references is None else references
+    rng = rng or random.Random(args.seed)
     for case in cases:
-        reference_output = None
-        if getattr(client, "rank_metrics", None) and "cold" not in args.groups:
+        reference_output = references.get(case['id'])
+        if reference_output is None and getattr(client, "rank_metrics", None) and "cold" not in args.groups:
             reference = execute_sample(client, case, "cold", args.output_length, "reference")
             if not reference["valid"]:
                 raise RuntimeError("Cold reference failed: " + reference["invalid_reason"])
             reference_output = reference["output_ids"]
         # 这里的 warmup 用于预热运行路径，不写入 samples.csv。
-        # 它与 execute_sample 内每次 L1 都要执行的 prepare 请求不同。
+        # prepare 只建立缓存；复用时一个 P 的所有 S 共用它。
         for _ in range(args.warmup_rounds):
             for group in args.groups:
                 row = execute_sample(client, case, group, args.output_length, "warmup")
@@ -481,7 +563,7 @@ def run_samples(client, cases, args, writer, file, common):
                 # 无效样本也立即落盘，但只增加 attempts，不增加 valid。
                 writer.writerow(row)
                 file.flush()
-                if '[Graph]' in row['invalid_reason']:
+                if any(tag in row['invalid_reason'] for tag in ('[Graph]', '[Prefix reuse]')):
                     raise RuntimeError(f"{case['id']}/{group}: {row['invalid_reason']}")
                 valid[group] += int(row["valid"])
                 print(
@@ -489,6 +571,7 @@ def run_samples(client, cases, args, writer, file, common):
                     f"client={row['client_latency_ms']:.2f} ms {row['invalid_reason']}",
                     flush=True,
                 )
+        references[case['id']] = reference_output
 
 
 def run(args):
@@ -595,6 +678,7 @@ def run(args):
                        else 'unknown')
             config['benchmark_modes'] = dict(load_format=info.get('load_format', 'unknown'),
                                              routing=routing, prefill_graph=client.prefill_graph or 'unknown',
+                                             prefix_reuse=args.prefix_reuse,
                                              planned_graph_buckets=info.get('cuda_graph_bs_prefill'))
             model_config_path = Path(args.tokenizer) / "config.json"
             model_config = json.loads(model_config_path.read_text()) if model_config_path.is_file() else {}

@@ -69,4 +69,6 @@ HTTP 返回不表示所有 rank 的 CUDA Event 已发布。指标模块检查预
 
 Qwen3.5 的 P 检查点同时包含 KV 与 GDN 状态，不能仅凭 cached_tokens 推断正确。控制接口、命中、实际计算量与传输验收见 [协议](usage.md)。
 
+Driver 默认每个 P 先完成 cold/reference，再调用 prepare_prefix 建立一次 P，跨 S 执行命中测量。补丁把请求级 skip_radix_cache_insert 传给 serving 已有的 checkpoint/release 逻辑，保留 P 读取和 GDN COW，结束时回收请求私有状态。完整 P+S 匹配及逐 rank 池基线用于检测后缀残留和泄漏。--no-prefix-reuse 使用逐样本准备流程；两种模式都记录在结果中。
+
 CPU 回归检查编排和协议，不能证明 CUDA 性能。历史 GPU 实验以 [各轮归档](experiments/README.md) 为准，新模式的 GPU 验收另行记录。

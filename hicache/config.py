@@ -18,7 +18,7 @@ ENV_OPTIONS = {
     "CHUNKED_PREFILL_SIZE": ("chunked-prefill-size", int),
     "DTYPE": ("dtype", str), "KV_DTYPE": ("kv-cache-dtype", str),
     "CONTEXT_LENGTH": ("context-length", int), "MAX_TOTAL_TOKENS": ("max-total-tokens", int),
-    "MEM_FRACTION": ("mem-fraction-static", float), "HICACHE_SIZE": ("hicache-size", float),
+    "MEM_FRACTION": ("mem-fraction-static", float), "HICACHE_SIZE": ("hicache-size", int),
 }
 
 
@@ -266,6 +266,8 @@ def build_run_parser():
     add("--server-profile-dir", help="Profiler 写入的服务端绝对路径；启用 --profile 时必须指定")
     add("--gpu-timing", action="store_true", help="记录原生 extend CUDA Event 区间；服务需 FORWARD_TIMING=1，区间可能包含等待")
     add("--prefill-graph", choices=('breakable', 'disabled'), help="要求正式请求在所有 rank 使用指定路径")
+    add("--prefix-reuse", action=argparse.BooleanOptionalAction, default=True,
+        help="默认同一个 P 跨 S/重复复用；--no-prefix-reuse 改为每次准备")
     add("--note", default="", help="保存在配置和图中的实验说明，例如未缩放 RoPE 外推；不影响请求内容")
     add("--telemetry-dir", help="宿主机采样目录；启用后关联请求窗口，监控缺口或额外 GPU 进程不计入正式有效数")
     add("--telemetry-same-host", action="store_true", help="确认客户端与遥测进程在同一主机且共用单调时钟；远程 SSH 隧道不满足此条件")

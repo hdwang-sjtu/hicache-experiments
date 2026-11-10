@@ -31,7 +31,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 # 路径与服务地址由总控掌握；诊断 Profiler/遥测仍使用独立 Driver。
 TEST_OPTIONS = {
     "prefix-lengths", "suffix-lengths", "groups", "output-length", "repeats", "max-attempts",
-    "warmup-rounds", "seed", "timeout", "ready-timeout", "no-plot", "gpu-timing", "note", "text-file",
+    "warmup-rounds", "seed", "timeout", "ready-timeout", "no-plot", "gpu-timing", "note", "text-file", "prefix-reuse",
 }
 CODE_FILES = code_files()
 
@@ -61,7 +61,9 @@ def test_arguments(settings):
         if action.nargs == 0:
             if type(value) is not bool:
                 raise ValueError(f"{key} 必须是 true/false")
-            if value:
+            if isinstance(action, argparse.BooleanOptionalAction):
+                argv.append(option if value else '--no-' + key)
+            elif value:
                 argv.append(option)
         elif action.nargs == "+":
             if not isinstance(value, list) or not value:
@@ -103,6 +105,16 @@ def verify_results(directory, expected):
     config = json.loads((directory / "config.json").read_text())
     if config.get("status") != "complete":
         raise RuntimeError("Driver 没有报告 complete")
+    if expected.prefix_reuse and any(g != 'cold' for g in expected.groups):
+        # 独立核对实际请求数，不能只相信配置里声明了复用。
+        prepared = Counter()
+        with (directory / 'responses.jsonl').open() as events:
+            for line in events:
+                event = json.loads(line)
+                if event.get('path') == '/generate' and event.get('stage') == 'prepare':
+                    prepared[event['response']['meta_info']['prompt_tokens']] += 1
+        if prepared != Counter({p: 1 for p in expected.prefix_lengths}):
+            raise RuntimeError(f'复用模式应每个 P 只准备一次，实际：{dict(prepared)}')
     wanted = {(p, s, group): expected.repeats for p in expected.prefix_lengths
               for s in expected.suffix_lengths for group in expected.groups}
     counts = Counter()
@@ -120,6 +132,8 @@ def verify_results(directory, expected):
     with (directory / "samples.csv").open() as file:
         for row in csv.DictReader(file):
             if row["valid"] == "True":
+                if expected.prefix_reuse and row['group'] != 'cold' and row.get('prefix_reuse') != 'True':
+                    raise RuntimeError('命中样本未记录启用前缀复用')
                 if expected.gpu_timing:
                     record = records[row["request_id"]]
                     before = {int(k): v for k, v in record["before"].items()}
@@ -192,7 +206,7 @@ class Job:
         self.args = args
         self.env = dict(os.environ if environ is None else environ)
         self.experiment_path, self.experiment = load_experiment(args.experiment, self.project)
-        for key in ("prefix_lengths", "suffix_lengths", "groups", "repeats", "no_plot"):
+        for key in ("prefix_lengths", "suffix_lengths", "groups", "repeats", "no_plot", "prefix_reuse"):
             value = getattr(args, key, None)
             if value is not None:
                 self.experiment["test"][key.replace("_", "-")] = value
@@ -552,6 +566,8 @@ def main():
     parser.add_argument("--load-format", choices=("dummy", "auto"), help="默认 dummy；auto 下载/加载真实权重")
     parser.add_argument("--routing", choices=("round-robin", "original"), help="默认 round-robin")
     parser.add_argument("--prefill-graph", choices=("breakable", "disabled"), help="默认 breakable；桶由 P/S 自动生成")
+    parser.add_argument("--prefix-reuse", action=argparse.BooleanOptionalAction, default=None,
+                        help="默认复用 P；--no-prefix-reuse 每次重新准备")
     parser.add_argument("--gpu", help="GPU 编号列表，例如 0,1,2,3")
     parser.add_argument("--port", type=int)
     parser.add_argument("--tp", type=int, choices=[1, 2, 4])
@@ -564,7 +580,7 @@ def main():
     parser.add_argument("--max-total-tokens", type=serve_config.positive_length)
     parser.add_argument("--chunked-prefill-size", type=serve_config.positive_length)
     parser.add_argument("--mem-fraction", type=float)
-    parser.add_argument("--hicache-size", type=float, help="每 rank 的主机缓存 GB")
+    parser.add_argument("--hicache-size", type=int, help="每 rank 的主机缓存整数 GB")
     parser.add_argument("--no-plot", action="store_true", default=None)
     args = parser.parse_args()
     if args.list_experiments:

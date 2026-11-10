@@ -9,6 +9,7 @@
 
 | 实验 | 状态 | 原始数据 |
 |---|---|---|
+| [2026-11-11：跨 S 复用 P 的 TP4/EP4 验收](2026-11-11-prefix-reuse.md) | native、Docker、长输入及开关对照共 49 个有效样本 | results/prefix-reuse-35b-tp4-*-20261111/ |
 | [2026-11-10：dummy / round-robin / Prefill Graph 验收](2026-11-10-synthetic-prefill.md) | eager、Graph、容量点和无权重 native 共 28 个有效样本 | results/refactor-35b-*-20261110/ |
 | [2026-11-05：Qwen3.5 统一入口 TP/EP 验收](2026-11-05-qwen35-unified.md) | 35B 五种组合共 180 个、122B 长前缀 9 个有效样本 | `results/unified-qwen35/` |
 | [Cold/L1 基线与 L2 验收](baseline-and-l2.md) | 基线 120 个、L2 180 个正式有效样本；另有流程验证和失败尝试 | `results/baseline-*`、`results/l2-*` |

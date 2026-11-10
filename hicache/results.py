@@ -38,7 +38,7 @@ FIELDS = [
     "host_tokens", "storage_tokens", "num_retractions", *TIMES,
     "forward_entry_time", "prefill_finished_time", *LOAD_FIELDS, FORWARD_FIELD,
     "tp", "ep", "prefill_forward_passes", "mamba_load_states",
-    "load_format", "routing", "prefill_graph", "prefill_graph_passes", "prefill_eager_passes",
+    "load_format", "routing", "prefill_graph", "prefix_reuse", "prefill_graph_passes", "prefill_eager_passes",
     "device_tokens_before", "host_backed_tokens_before",
     "device_used_tokens_before", "host_used_tokens_before",
     "device_used_tokens_after", "host_used_tokens_after", "output_ids", "profiled", *ENV_FIELDS, "valid", "invalid_reason",
@@ -47,7 +47,8 @@ FIELDS = [
 
 def mode_label(config):
     modes = config.get("benchmark_modes", {})
-    return " / ".join(str(modes.get(k, "unknown")) for k in ("load_format", "routing", "prefill_graph"))
+    label = " / ".join(str(modes.get(k, "unknown")) for k in ("load_format", "routing", "prefill_graph"))
+    return label + ' / prefix_reuse=' + str(modes.get('prefix_reuse', 'unknown'))
 
 
 def percentile(values, fraction):

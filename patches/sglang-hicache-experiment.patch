@@ -62,10 +62,38 @@ index 7165a5ca8c3cceea29b66862bf27f3a2a97c9fae..292b38f5b08567c28eeceb752be9cbb6
  @auth_level(AuthLevel.ADMIN_OPTIONAL)
  async def add_external_corpus(request: Request):
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index e32fc011409086dc7e5b03b6e80a19900fb4df41..17a578fd5873c32c1ce76c526659b4d71b654455 100644
+index e32fc011409086dc7e5b03b6e80a19900fb4df41..2db7ef183a2bfc0f95e9437679f2782dd71e0088 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -1855,6 +1855,20 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
+@@ -368,6 +368,9 @@ class GenerateReqInput:
+     # Cache namespace used to isolate otherwise-identical prefixes.
+     cache_salt: Optional[Union[List[str], str]] = None
+ 
++    # Experiment-only: read shared prefixes but keep new KV/state request-local.
++    skip_radix_cache_insert: bool = False
++
+     # Versioned KV-hint envelope, set by a trusted orchestrator after worker
+     # selection and never by an application client. Passed through untouched to
+     # the HiCache storage backends, each of which reads only the action types it
+@@ -1037,6 +1040,7 @@ class GenerateReqInput:
+             priority=self.priority,
+             extra_key=self.extra_key[i] if self.extra_key is not None else None,
+             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
++            skip_radix_cache_insert=self.skip_radix_cache_insert,
+             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
+             no_logs=self.no_logs,
+             custom_labels=self.custom_labels,
+@@ -1174,6 +1178,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+     # defaulted tail field so older IPC senders decode as selected mode.
+     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+ 
++    # Append-only IPC field; ordinary senders keep normal cache publication.
++    skip_radix_cache_insert: bool = False
++
+     def wrap_pickle_fields(self):
+         self.time_stats = wrap_as_pickle(self.time_stats)
+ 
+@@ -1855,6 +1862,20 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
      message: str = ""
  
  
@@ -87,7 +115,7 @@ index e32fc011409086dc7e5b03b6e80a19900fb4df41..17a578fd5873c32c1ce76c526659b4d7
      corpus_id: Optional[str] = None
      file_path: Optional[str] = None
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 79efa0bacc63b49c08540af6bcc644576e1b12a0..3e50bbac02e2e4d7bae1b5c9dafa1061912e8312 100644
+index 79efa0bacc63b49c08540af6bcc644576e1b12a0..e0282482f88514e69dcca489945d631daebca295 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -150,6 +150,8 @@ from sglang.srt.managers.io_struct import (
@@ -153,7 +181,19 @@ index 79efa0bacc63b49c08540af6bcc644576e1b12a0..3e50bbac02e2e4d7bae1b5c9dafa1061
                  (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                  (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                  (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
-@@ -5345,6 +5387,36 @@ class Scheduler(
+@@ -2908,6 +2950,11 @@ class Scheduler(
+             )
+             req.tokenizer = self.tokenizer
+ 
++            # Keep normal prefix matching/COW. Both intermediate checkpoints and
++            # final release already honor this bit in mem_cache.common; release
++            # frees only request-owned KV and GDN slots, preserving cached P.
++            req.skip_radix_cache_insert |= recv_req.skip_radix_cache_insert
++
+             if radix_native_session:
+                 req.session_generation = self.tree_cache.ensure_session_generation(
+                     recv_req.session_id
+@@ -5345,6 +5392,36 @@ class Scheduler(
  
          return DetachHiCacheStorageReqOutput(success=False, message=msg)
  
@@ -224,11 +264,35 @@ index f62afbae8ed6023cdb161649af1eb70120437731..fefde68ec5ffea23a0c26f6055b1707f
      async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
          """Clear the hierarchical cache storage."""
          self.auto_create_handle_loop()
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 3dd350f411ed36b6339794e1489909ab81f07297..16ad19bcd9c3c7ae27c0acd73980692c8df4354e 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -902,6 +902,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+ 
+         # Normalize the request
+         obj.normalize_batch_and_arguments()
++        if isinstance(obj, GenerateReqInput):
++            if type(obj.skip_radix_cache_insert) is not bool:
++                raise ValueError("skip_radix_cache_insert must be a bool")
++            if obj.skip_radix_cache_insert and not get_memory().enable_hicache_experiment:
++                raise ValueError("skip_radix_cache_insert requires --enable-hicache-experiment")
+         self._set_default_priority(obj)
+         if (
+             isinstance(obj, GenerateReqInput)
+@@ -1618,6 +1623,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 kv_hints=obj.kv_hints,
+                 extra_key=obj.extra_key,
+                 cache_salt=obj.cache_salt,
++                skip_radix_cache_insert=obj.skip_radix_cache_insert,
+                 routing_key=obj.routing_key,
+                 token_type_ids=token_type_ids,
+                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
 diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
-index d1399f088dc0c8236497fb8c956a3b5a89e9865d..6840d46bc3bbb7a1e0edf4c48ee86867118bb237 100644
+index d1399f088dc0c8236497fb8c956a3b5a89e9865d..343bdde7cefbe1913eb29f2517424f3a18ffc628 100644
 --- a/python/sglang/srt/mem_cache/unified_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
-@@ -856,6 +856,176 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -856,6 +856,177 @@ class UnifiedRadixCache(BasePrefixCache):
          self._free_values(result.device_frees, result.host_frees)
          self._accumulate_tracker(tracker, result.tracker)
  
@@ -302,6 +366,7 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..6840d46bc3bbb7a1e0edf4c48ee86867
 +            device_free = self.token_to_kv_pool_allocator.available_size()
 +            host_free = cc.mem_pool_host.available_size()
 +            state = dict(
++                skip_radix_cache_insert=True,
 +                prefix_tokens=len(prefix_ids),
 +                matched_tokens=match.full_kv_hit_length,
 +                device_tokens=match.device_prefix_len,

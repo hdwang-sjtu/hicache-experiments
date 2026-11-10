@@ -49,6 +49,13 @@ class SyntheticConfiguration(unittest.TestCase):
         self.assertNotIn('cuda-graph-bs-prefill', other.resolution['server'])
         self.assertEqual(other.resolution['environment']['SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS'], '0')
 
+    def test_hicache_override_remains_integer_and_prefix_reuse_reaches_driver(self):
+        job = self.job(hicache_size=2, prefix_reuse=False)
+        self.assertIs(type(job.resolution['server']['hicache-size']), int)
+        self.assertEqual(job.resolution['server']['hicache-size'], 2)
+        self.assertFalse(job.test.prefix_reuse)
+        self.assertIn('--no-prefix-reuse', job.test_argv)
+
     def test_dummy_does_not_inspect_even_broken_existing_weights(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)

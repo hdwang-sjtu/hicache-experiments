@@ -4,6 +4,8 @@
 
 **默认使用 dummy 随机权重、round-robin MoE 路由和 breakable prefill CUDA Graph。** 不下载模型权重，只准备配置、tokenizer 和 processor；仍然执行完整模型计算并占用相应显存。
 
+同一个 P 下，所有 S、预热和重复测量默认共用一次 P 准备。每次 P+S 请求只读取共享 P，新增 KV/GDN 状态在请求结束时释放，因此 S 每次都重新计算。cold/reference 仍完整计算 P+S，集中在准备 P 之前运行。
+
 在已有 SGLang 依赖的环境中，例如 Vast 的 SGLang 容器：
 
     python3 -m pip install -r requirements-launch.txt
@@ -24,6 +26,7 @@
 | --load-format | dummy：随机初始化，不下载权重 | auto：下载/加载真实权重 |
 | --routing | round-robin：确定性的均衡路由 | original：使用模型 router |
 | --prefill-graph | breakable：分段 prefill Graph | disabled：eager |
+| --prefix-reuse | 开启：同 P 跨 S/重复复用 | --no-prefix-reuse：每次重新准备 P |
 
 例如使用真实权重、原始路由和 eager：
 
