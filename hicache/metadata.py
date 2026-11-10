@@ -11,6 +11,37 @@ from pathlib import Path
 import shutil
 import subprocess
 
+from hicache.prepare import write_json
+
+PROJECT = Path(__file__).resolve().parents[1]
+
+
+def code_files(project=PROJECT):
+    """归档整个小工具包；不再分别维护 Driver/启动器的易遗漏模块清单。"""
+    project = Path(project)
+    # 远程客户端可以只复制 run_experiment.py 和包，不要求拥有 Shell 启动器。
+    entries = tuple(name for name in ("run_all.py", "run_experiment.py", "serve.sh", "launch_server.sh")
+                    if (project / name).is_file())
+    configuration = tuple(str(p.relative_to(project)) for pattern in (
+        'configs/experiments/*.yaml', 'configs/runtime.lock.json', 'patches/*.patch')
+                          for p in sorted(project.glob(pattern)) if p.is_file())
+    return (*entries, *configuration,
+            *(str(p.relative_to(project)) for folder in ("hicache", "tools")
+              for p in sorted((project / folder).glob("*.py"))))
+
+
+def snapshot_code(destination, project=PROJECT):
+    """保留包目录和相对导入；整个运行目录搬走后仍能运行已冻结的入口。"""
+    destination, project = Path(destination), Path(project)
+    hashes = {}
+    for name in code_files(project):
+        content = (project / name).read_bytes()
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        hashes[name] = hashlib.sha256(content).hexdigest()
+    return hashes
+
 
 def record(args):
     directory = Path(args.directory)
@@ -57,6 +88,7 @@ def record(args):
             key: os.environ.get(key) for key in (
                 "CUDA_VISIBLE_DEVICES", "PYTHONPATH", "SGLANG_ENABLE_METRICS_DEVICE_TIMER",
                 "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
+                "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS", "SGLANG_SIMULATE_UNIFORM_EXPERTS",
             )
         }
     metadata["source_version_available"] = "sglang_commit" in metadata
@@ -71,18 +103,15 @@ def record(args):
         metadata["profile"]["server_config_sha256"] = hashlib.sha256(profile["server_yaml"].encode()).hexdigest()
     # 总控已把所有脚本冻结在同一结果包的 code/；独立启动才复制 launch-source/。
     # 路径相对 launch.json 保存，整个结果目录换机器后仍可追溯到源码。
-    managed = Path(__file__).resolve().parent == directory.resolve().parent / "code"
+    managed = PROJECT == directory.resolve().parent / "code"
     snapshot = directory.parent / "code" if managed else directory / "launch-source"
     if not managed:
         snapshot.mkdir()
     metadata["launcher_source"] = os.path.relpath(snapshot, directory)
-    metadata["launcher_sha256"] = {}
-    for name in ("serve.sh", "launch_server.sh", "launch_metadata.py", "serve_config.py", "prepare_runtime.py"):
-        path = Path(__file__).with_name(name)
-        if not managed:
-            shutil.copyfile(path, snapshot / name)
-        metadata["launcher_sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    (directory / "launch.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+    metadata["launcher_sha256"] = (
+        {name: hashlib.sha256((PROJECT / name).read_bytes()).hexdigest() for name in code_files()}
+        if managed else snapshot_code(snapshot))
+    write_json(directory / "launch.json", metadata)
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,memory.total,memory.used", "--format=csv"],

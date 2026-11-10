@@ -12,7 +12,8 @@ from pathlib import Path
 import re
 import time
 
-from experiment_results import FORWARD_FIELD, write_json
+from hicache.results import FORWARD_FIELD
+from hicache.prepare import write_json
 
 class EnvironmentMonitor:
     """只读宿主机采样，缓存正确性与环境覆盖分别记录，不按延迟大小过滤。"""
@@ -335,3 +336,25 @@ def analyze_traces(directory, no_plot=False):
         fig.savefig(directory / "profile_timeline.png", dpi=180)
         plt.close(fig)
     print(f"Trace analysis: {directory / 'profile_summary.csv'}")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("monitor")
+    p.add_argument("--kind", choices=("gpu", "host"), required=True)
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--interval", type=float, default=1.)
+    p = sub.add_parser("analyze-traces")
+    p.add_argument("directory", type=Path)
+    p.add_argument("--no-plot", action="store_true")
+    args = parser.parse_args()
+    if args.command == "monitor":
+        monitor(args)
+    else:
+        analyze_traces(args.directory, args.no_plot)
+
+
+if __name__ == "__main__":
+    main()

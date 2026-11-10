@@ -9,11 +9,12 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from run_experiment import (make_cases, digest, run_samples, validate, check_server)
-from experiment_results import FIELDS, write_json, analyze, percentile, summarize_rows
-from experiment_diagnostics import (EnvironmentMonitor, sample_gpu_devices, merge_intervals,
+from hicache.benchmark import (make_cases, digest, run_samples, validate, check_server)
+from hicache.results import FIELDS, analyze, percentile, summarize_rows
+from hicache.prepare import write_json
+from tools.diagnostics import (EnvironmentMonitor, sample_gpu_devices, merge_intervals,
                                     overlap_duration, trace_intervals)
-from rank_metrics import RankMetrics, parse_metrics, metric_delta
+from hicache.metrics import RankMetrics, parse_metrics, metric_delta
 
 
 def self_test(metrics_path):

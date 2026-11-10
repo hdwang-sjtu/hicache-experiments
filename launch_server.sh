@@ -2,15 +2,16 @@
 # 宿主机入口：准备 Docker 环境并调用 serve.sh，不重复定义 SGLang 参数。
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 if [[ ${1:-} == --help ]]; then
     cat <<'HELP'
 用法：bash launch_server.sh <配置名> [--dry-run] [SGLang 参数 ...]
-  MODEL_ROOT=/models GPU=0 bash launch_server.sh qwen3-8b-4k
+  MODEL_DIR=/models/Qwen3-8B GPU=0 bash launch_server.sh qwen3-8b-smoke
   bash launch_server.sh --list-configs
 必须选择配置名，服务参数统一来自命名配置。
 需要宿主机 Docker + NVIDIA runtime、本地已有镜像和模型。
 已有 SGLang 环境（包括 Vast 普通容器）请直接用 bash serve.sh。
-  MODEL_ROOT / MODEL_DIR   模型根目录 / 完整模型目录覆盖（均为宿主机路径）
+  MODEL_DIR   完整模型/配置目录（均为宿主机路径）
   SGLANG_DIR               源码目录；显式 SGLANG_DIR='' 使用镜像安装包
   IMAGE                    默认 lmsysorg/sglang:latest，启动前固定为本地镜像 ID
   GPU                      宿主机 GPU 编号或 UUID，默认 0
@@ -29,7 +30,7 @@ while (($#)); do
     case "$1" in
         --dry-run) dry_run=true; shift ;;
         --resolved-profile) resolved_profile="${2:?缺少已解析配置路径}"; shift 2 ;;
-        --list-configs) python3 "$SCRIPT_DIR/serve_config.py" list; exit ;;
+        --list-configs) python3 "$SCRIPT_DIR/hicache/config.py" list; exit ;;
         --) shift; break ;;
         -*) break ;;
         *) [[ -z "$profile" ]] || { echo '只能选择一个配置名。' >&2; exit 2; }
@@ -42,11 +43,11 @@ if [[ -n "$resolved_profile" ]]; then
     [[ -z "$profile" && $# == 0 ]] || { echo '已解析配置不能追加参数。' >&2; exit 2; }
     profile_json="$(cat "$resolved_profile")"
 elif [[ -n "$profile" ]]; then
-    profile_json="$(python3 "$SCRIPT_DIR/serve_config.py" resolve --runtime docker "$profile" -- "$@")"
+    profile_json="$(python3 "$SCRIPT_DIR/hicache/config.py" resolve --runtime docker "$profile" -- "$@")"
 else
-    echo '请指定 configs/serve 下的配置名；用 --list-configs 查看。' >&2; exit 2
+    echo '请指定 configs/experiments 下的配置名；用 --list-configs 查看。' >&2; exit 2
 fi
-mapfile -d '' -t values < <(python3 "$SCRIPT_DIR/serve_config.py" unpack <<< "$profile_json")
+mapfile -d '' -t values < <(python3 "$SCRIPT_DIR/hicache/config.py" unpack <<< "$profile_json")
 ((${#values[@]} >= 4)) || exit 2
 MODEL_DIR="${values[0]}"
 env_count="${values[3]}"
@@ -67,7 +68,7 @@ fi
 [[ "$RESULTS_DIR" == /* ]] || RESULTS_DIR="$PWD/$RESULTS_DIR"
 if [[ -n "$SGLANG_DIR" && "$SGLANG_DIR" != /* ]]; then SGLANG_DIR="$PWD/$SGLANG_DIR"; fi
 # HF 快照挂载所属缓存根，保留仓库/共享 blobs 链接；普通模型目录仍直接挂载。
-mapfile -d '' -t model_mount < <(python3 "$SCRIPT_DIR/serve_config.py" model-mount "$MODEL_DIR")
+mapfile -d '' -t model_mount < <(python3 "$SCRIPT_DIR/hicache/config.py" model-mount "$MODEL_DIR")
 ((${#model_mount[@]} == 2)) || exit 2
 # host 网络保留 loopback 控制接口语义；远程客户端通过 SSH 隧道访问。
 # 不把物理 GPU 编号再次传为容器 CUDA_VISIBLE_DEVICES，避免二次编号选择。
@@ -96,7 +97,7 @@ fi
 for entry in "${profile_environment[@]}"; do docker_args+=(--env "$entry"); done
 command=(bash /experiment/serve.sh --exec --resolved-profile "/results/$RUN_ID/profile-resolution.json")
 if "$dry_run"; then
-    python3 "$SCRIPT_DIR/serve_config.py" preview <<< "$profile_json"
+    python3 "$SCRIPT_DIR/hicache/config.py" preview <<< "$profile_json"
     printf '%q ' "${docker_args[@]}" "$IMAGE" "${command[@]}"
     printf '\n'
     exit 0
@@ -110,7 +111,7 @@ mkdir -p "$RESULTS_DIR"
 run_dir="$RESULTS_DIR/$RUN_ID"
 mkdir "$run_dir"
 # 在宿主机写记录，保留 NFS root-squash 下的普通用户写入能力。
-python3 "$SCRIPT_DIR/launch_metadata.py" --directory "$run_dir" --runtime docker \
+python3 "$SCRIPT_DIR/hicache/metadata.py" --directory "$run_dir" --runtime docker \
     --model-dir "$MODEL_DIR" --source-dir "$SGLANG_DIR" --gpu "$GPU" \
     --image-id "$image_id" --image-ref "$IMAGE" --profile-json "$profile_json" \
     -- "${docker_args[@]}" "$image_id" "${command[@]}"

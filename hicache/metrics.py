@@ -6,7 +6,8 @@ import time
 
 FORWARD = {
     ('sglang:forward_execution_seconds_total', 'category', 'extend'): 'seconds',
-    ('sglang:cuda_graph_passes_total', 'mode', 'prefill_none'): 'passes',
+    ('sglang:cuda_graph_passes_total', 'mode', 'prefill_none'): 'eager_passes',
+    ('sglang:cuda_graph_passes_total', 'mode', 'prefill_cuda_graph'): 'graph_passes',
     ('sglang:realtime_tokens_total', 'mode', 'prefill_compute'): 'compute',
     ('sglang:prefill_effective_tokens_total', 'mode', 'device_hit'): 'device',
     ('sglang:prefill_effective_tokens_total', 'mode', 'host_hit'): 'host',
@@ -84,10 +85,32 @@ def parse_metrics(text, tp, ep, hybrid, *, gpu_timing=True):
         if not key.endswith('seconds') and not value.is_integer():
             raise RuntimeError(f'非整数计数 rank={rank} {key}')
         result[rank][key] = value
+    # Prometheus 的带标签 counter 在第一次使用前可能没有对应行；只允许这
+    # 两种执行路径的未创建标签为零，时间/token/rank 证据仍必须完整。
+    if gpu_timing:
+        for state in result.values():
+            state.setdefault('eager_passes', 0)
+            state.setdefault('graph_passes', 0)
     missing = {r: sorted(required - v.keys()) for r, v in result.items() if required != v.keys()}
     if missing:
         raise PendingMetrics(f'指标尚未完整发布：{missing}')
+    if gpu_timing:
+        for state in result.values():
+            state['passes'] = state['eager_passes'] + state['graph_passes']
     return result
+
+
+def graph_error(deltas, mode):
+    """检查每个 rank，不能只看 rank 0 或服务启动时是否成功捕获。"""
+    if mode not in ('breakable', 'disabled'):
+        return ''
+    for rank, delta in deltas.items():
+        graph = delta.get('graph_passes', 0)
+        eager = delta.get('eager_passes', delta['passes'] - graph)
+        wanted = (delta['passes'], 0) if mode == 'breakable' else (0, delta['passes'])
+        if (graph, eager) != wanted:
+            return f'[Graph] rank={rank} mode={mode}, graph/eager={(graph, eager)}, expected={wanted}'
+    return ''
 
 
 def metric_delta(before, after, *, p, s, group, chunk, state, gpu_timing=True):
@@ -172,6 +195,7 @@ class RankMetrics:
         after = self.snapshot(stage + ':metrics_after', before, **expected)
         expectation = dict(expected, chunk=self.chunk, gpu_timing=self.gpu_timing)
         delta = metric_delta(before, after, **expectation)
+        self.last_deltas = delta
         record = dict(stage=stage, request_id=rid, tp=self.tp, ep=self.ep,
                       expected=expectation, before=before, after=after, deltas=delta)
         with self.path.open('a') as file:
@@ -183,5 +207,7 @@ class RankMetrics:
                     mamba_load_states=delta[0].get('mamba_states', 0))
         if self.gpu_timing:
             result.update(prefill_forward_gpu_ms=max(d['seconds'] for d in delta.values()) * 1000,
-                          prefill_forward_passes=delta[0]['passes'])
+                          prefill_forward_passes=delta[0]['passes'],
+                          prefill_graph_passes=delta[0].get('graph_passes', 0),
+                          prefill_eager_passes=delta[0].get('eager_passes', delta[0]['passes']))
         return result

@@ -9,6 +9,7 @@
 
 | 实验 | 状态 | 原始数据 |
 |---|---|---|
+| [2026-11-10：dummy / round-robin / Prefill Graph 验收](2026-11-10-synthetic-prefill.md) | eager、Graph、容量点和无权重 native 共 28 个有效样本 | results/refactor-35b-*-20261110/ |
 | [2026-11-05：Qwen3.5 统一入口 TP/EP 验收](2026-11-05-qwen35-unified.md) | 35B 五种组合共 180 个、122B 长前缀 9 个有效样本 | `results/unified-qwen35/` |
 | [Cold/L1 基线与 L2 验收](baseline-and-l2.md) | 基线 120 个、L2 180 个正式有效样本；另有流程验证和失败尝试 | `results/baseline-*`、`results/l2-*` |
 | [2026-10-31：GPU 计时与固定 P 扫描 S](2026-10-31-gpu-timing.md) | 240 个正式有效样本，Profiler 独立保存 | `results/timing-*` |
@@ -37,7 +38,9 @@
 经逐字节比对，`l2-scan`、`timing-scan`、`prefix-scan-128k` 归档的 `sglang.patch` 都与该补丁一致；新 SGLang commit 固定了这份代码。
 Driver 经历多个版本，不能用最新提交代替全部历史快照；逐轮记录保留已核对的哈希。
 
-## 本次整理的验证
+## 历史整理的验证
+
+以下保留旧整理时的环境和验证记录；当前重构验收见上表 2026-11-10 记录。
 
 - 两脚本的模拟 `self-test`、Python/Bash 语法和 Git whitespace 检查通过。
 - CPU-only 容器验证通过：旧基线和计时 CSV 的汇总不变，固定 P/固定 S 的坐标与对数延迟轴正确，九面板曲线和四张矩阵热力图布局正确。

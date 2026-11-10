@@ -21,8 +21,8 @@ import yaml
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
-from prepare_runtime import docker_model_mount, inspect_model, prepare_model
-from run_all import CODE_FILES, Job, verify_results
+from hicache.prepare import docker_model_mount, inspect_model, prepare_model
+from hicache.runner import CODE_FILES, Job, verify_results
 
 # 提供就绪状态和任务身份，供真实总控轮询；不加载模型、不访问 GPU。
 SERVER = '''#!/bin/bash
@@ -80,9 +80,10 @@ class TaskFlow(unittest.TestCase):
         self.project = self.root/'project'
         self.project.mkdir()
         for name in CODE_FILES:
+            (self.project / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(PROJECT/name, self.project/name)
         for name in ('configs','patches'):
-            shutil.copytree(PROJECT/name,self.project/name)
+            shutil.copytree(PROJECT/name,self.project/name,dirs_exist_ok=True)
         (self.project/'serve.sh').write_text(SERVER)
         experiment=yaml.safe_load((self.project/'configs/experiments/qwen3-8b-smoke.yaml').read_text())
         experiment['test'].update(groups=['cold'],repeats=1,**{'gpu-timing':False,'no-plot':True,'ready-timeout':1})
@@ -130,7 +131,7 @@ class TaskFlow(unittest.TestCase):
         (job.root/'server').mkdir(parents=True)
         cid='a'*64
         (job.root/'server/container.id').write_text(cid)
-        with patch('run_all.subprocess.run') as command:
+        with patch('hicache.runner.subprocess.run') as command:
             command.return_value=argparse.Namespace(returncode=0,stderr='')
             job.cleanup()
         self.assertEqual([call.args[0] for call in command.call_args_list],
@@ -146,14 +147,14 @@ class TaskFlow(unittest.TestCase):
             def command(argv, **_):
                 if '--output' in argv:
                     output = Path(argv[argv.index('--output')+1])
-                    output.write_text(json.dumps({'path': str(actual if argv[2]=='model' else self.root/'source')}))
+                    output.write_text(json.dumps({'path': str(actual if argv[3]=='model' else self.root/'source')}))
             with patch.object(job, 'command', side_effect=command) as commands:
                 Job.prepare(job)
             self.assertEqual(job.model, actual)
             self.assertEqual(job.env['MODEL_DIR'], str(actual))
             model_args = commands.call_args.args[0]
             self.assertEqual('--directory' in model_args, local is not None)
-            self.assertEqual(model_args[2], 'model')
+            self.assertEqual(model_args[3], 'model')
             job.args.runtime = 'docker'
             with patch.object(job, 'container_id', return_value='a'*64):
                 driver = Job.driver_command(job)
@@ -369,7 +370,7 @@ class ModelPreparation(unittest.TestCase):
             for override in ({'HF_HOME': str(base)}, {'HF_HUB_CACHE': str(cache), 'HF_HOME': str(self.root/'other')}):
                 with self.subTest(shared=shared, override=override):
                     output = self.root/'model.json'
-                    result = subprocess.run([sys.executable, str(PROJECT/'prepare_runtime.py'), 'model',
+                    result = subprocess.run([sys.executable, '-m', 'hicache.prepare', 'model', '--load-format', 'auto',
                                              '--repo', 'org/model', '--revision', self.revision, '--output', str(output)],
                                             env={**clean_env, **override, 'HF_HUB_OFFLINE': '1'},
                                             capture_output=True, text=True, timeout=15)

@@ -14,9 +14,9 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
-import rank_metrics as metrics
-from run_all import Job
-from run_experiment import Client
+import hicache.metrics as metrics
+from hicache.runner import Job
+from hicache.benchmark import Client
 
 PROJECT = Path(__file__).resolve().parents[1]
 
@@ -97,8 +97,9 @@ class RankEvidence(unittest.TestCase):
                     for rank, row in counters.items():
                         labels = f'tp_rank="{rank}",pp_rank="0",dp_rank="0",moe_ep_rank="{rank}"'
                         for (name, label, value), key in metrics.FORWARD.items():
-                            if key in row:
-                                lines.append(f'{name}{{{labels},{label}="{value}"}} {row[key]}')
+                            source = 'passes' if key == 'eager_passes' else key
+                            if source in row:
+                                lines.append(f'{name}{{{labels},{label}="{value}"}} {row[source]}')
                         for name, key in metrics.LOAD.items():
                             lines.append(f'{name}{{{labels}}} {row[key]}')
                         for pool, key in [('kv', 'kv_tokens'), ('mamba', 'mamba_states')]:
@@ -141,7 +142,8 @@ class RankEvidence(unittest.TestCase):
         with self.assertRaises(RuntimeError): metrics.check_state(self.state(), 'l2', 256, 4)
 
     def counters(self, tp=2):
-        sample = dict(seconds=.1, passes=1, compute=128, input=128, device=0, host=256, storage=0,
+        sample = dict(seconds=.1, passes=1, eager_passes=1, graph_passes=0,
+                      compute=128, input=128, device=0, host=256, storage=0,
                       kv_tokens=256, load_seconds=.01, load_ops=1, load_bytes=6144, mamba_states=2)
         return {r: dict(sample) for r in range(tp)}
 
@@ -210,7 +212,7 @@ class ClientArchive(unittest.TestCase):
         text = '\n'.join(lines)
         events = io.StringIO()
         client = Client('http://localhost:39081', 1, events)
-        with patch('run_experiment.urllib.request.urlopen',
+        with patch('hicache.benchmark.urllib.request.urlopen',
                    side_effect=lambda *_args, **_kwargs: io.BytesIO(text.encode())):
             for _ in range(32):
                 result, elapsed = client.request('/metrics', stage='metrics_before', parse_json=False)
@@ -224,7 +226,7 @@ class ClientArchive(unittest.TestCase):
             ('/generate', {'rid': 'measured-request'}, {'output_ids': [7]}),
             ('/debug/hicache', {'action': 'inspect'}, {'success': True, 'ready': True}),
         ]:
-            with patch('run_experiment.urllib.request.urlopen',
+            with patch('hicache.benchmark.urllib.request.urlopen',
                        return_value=io.BytesIO(json.dumps(response).encode())):
                 result, _ = client.request(path, payload, stage='measure')
             record = json.loads(events.getvalue().splitlines()[-1])
@@ -245,7 +247,7 @@ class ClientArchive(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 events = io.StringIO()
                 client = Client('http://localhost:39081', 1, events)
-                with patch('run_experiment.urllib.request.urlopen', side_effect=error), \
+                with patch('hicache.benchmark.urllib.request.urlopen', side_effect=error), \
                      self.assertRaisesRegex(RuntimeError, 'metrics_after /metrics'):
                     client.request('/metrics', stage='metrics_after', parse_json=False)
                 record = json.loads(events.getvalue())
@@ -257,7 +259,7 @@ class ClientArchive(unittest.TestCase):
 
 class GroupSelection(unittest.TestCase):
     def test_l1_only_still_has_cold_reference_outside_csv(self):
-        import run_experiment as driver
+        import hicache.benchmark as driver
         args = argparse.Namespace(seed=0, groups=['l1'], output_length=1,
                                   warmup_rounds=1, repeats=2, max_attempts=2)
         calls = []
@@ -277,7 +279,7 @@ class GroupSelection(unittest.TestCase):
 
 class LocalModel(unittest.TestCase):
     def test_readonly_inventory_and_corrupt_tensor_bounds(self):
-        from prepare_runtime import inspect_model
+        from hicache.prepare import inspect_model
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / 'config.json').write_text('{"model_type":"qwen3_5"}')

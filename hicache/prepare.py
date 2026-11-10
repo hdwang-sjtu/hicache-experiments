@@ -15,6 +15,33 @@ import tempfile
 DIFF_ARGS = ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv",
              "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--diff-algorithm=myers"]
 
+# 明确白名单，不能用无过滤 snapshot_download；dummy 不需要任何权重或分片索引。
+ASSET_FILES = (
+    "config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
+    "tokenizer.model", "spiece.model", "vocab.json", "vocab.txt", "merges.txt",
+    "special_tokens_map.json", "added_tokens.json", "preprocessor_config.json",
+    "processor_config.json", "chat_template.jinja", "chat_template.json",
+)
+
+
+def inspect_assets(path):
+    """只打开配置和 tokenizer；即使目录含残缺权重，dummy 也不读取它们。"""
+    path = Path(path).resolve()
+    config = json.loads((path / "config.json").read_text())
+    if not isinstance(config, dict):
+        raise ValueError("模型 config.json 无效")
+    tokenizers = ("tokenizer.json", "tokenizer.model", "spiece.model", "vocab.txt", "vocab.json")
+    if not any((path / name).is_file() and (path / name).stat().st_size for name in tokenizers):
+        raise FileNotFoundError("模型缺少非空 tokenizer 文件")
+    if config.get("vision_config") and not (path / "preprocessor_config.json").is_file():
+        raise FileNotFoundError("多模态模型缺少 preprocessor_config.json")
+    text = config.get("text_config", config)
+    return dict(path=str(path), files={name: {"size": (path / name).stat().st_size}
+                                     for name in ASSET_FILES if (path / name).is_file()},
+                weight_bytes=0, model_type=text.get("model_type"),
+                state_chunk_size=text.get("mamba_chunk_size", 64),
+                config_sha256=hashlib.sha256((path / "config.json").read_bytes()).hexdigest())
+
 
 def write_json(path, value):
     """同目录原子替换，状态读取者不会看到半截 JSON。"""
@@ -198,11 +225,16 @@ def inspect_model(path):
                 model_type=text_config.get('model_type'), state_chunk_size=text_config.get('mamba_chunk_size', 64))
 
 
-def prepare_model(repo, revision, directory=None, downloader=None):
+def prepare_model(repo, revision, directory=None, downloader=None, load_format="auto"):
     """指定目录则检查/补齐；否则直接使用 HF 返回的默认缓存路径。"""
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("模型 revision 必须是固定的完整 commit SHA")
+    if load_format not in ("auto", "dummy"):
+        raise ValueError("load-format 只支持 dummy/auto")
+    inspect = inspect_assets if load_format == "dummy" else inspect_model
     options = dict(repo_id=repo, revision=revision)
+    if load_format == "dummy":
+        options["allow_patterns"] = list(ASSET_FILES)
     if directory is not None:
         directory = Path(directory).expanduser().resolve()
         # 只读取现有来源线索，不新建完成标记，也不把线索视为内容哈希。
@@ -219,30 +251,35 @@ def prepare_model(repo, revision, directory=None, downloader=None):
             if re.fullmatch(r"[0-9a-f]{40}", recorded) and recorded != revision:
                 raise ValueError("模型目录的 HF 下载版本与实验配置冲突")
         try:
-            info = inspect_model(directory)
+            info = inspect(directory)
         except FileNotFoundError:
             pass
         else:
             print(f"使用已有模型：{directory}", flush=True)
-            return dict(info, repo=repo, requested_revision=revision, source="directory", download_requested=False)
+            return dict(info, repo=repo, requested_revision=revision, source="directory",
+                        load_format=load_format, download_requested=False)
         if storage != directory:
             options["cache_dir"] = str(storage.parent)
         else:
             options["local_dir"] = str(directory)
             # 只补缺失文件，避免覆盖已有权重或让下载库扫描无元数据的大文件。
-            options["ignore_patterns"] = [str(p.relative_to(directory)) for p in directory.rglob("*") if p.is_file()]
+            options["ignore_patterns"] = ([name for name in ASSET_FILES if (directory / name).is_file()]
+                                           if load_format == "dummy" else
+                                           [str(p.relative_to(directory)) for p in directory.rglob("*") if p.is_file()])
     if downloader is None:
         from huggingface_hub import constants, snapshot_download
         downloader = snapshot_download
         if constants.HF_HUB_OFFLINE:
             options["local_files_only"] = True
-    print(f"下载/补齐模型 {repo}@{revision} → {directory or 'HF 默认缓存'}", flush=True)
+    print(f"下载/补齐 {'配置与 tokenizer（dummy）' if load_format == 'dummy' else '真实权重'} "
+          f"{repo}@{revision} → {directory or 'HF 默认缓存'}", flush=True)
     downloaded = Path(downloader(**options)).resolve()
     if directory is not None and downloaded != directory:
         raise RuntimeError(f"HF 返回路径与指定模型目录不符：{downloaded}")
-    info = inspect_model(downloaded)
+    info = inspect(downloaded)
     return dict(info, repo=repo, requested_revision=revision,
-                source="directory" if directory is not None else "huggingface", download_requested=True)
+                source="directory" if directory is not None else "huggingface",
+                load_format=load_format, download_requested=True)
 
 
 def main():
@@ -257,6 +294,7 @@ def main():
     model.add_argument("--directory", type=Path, help="完整模型目录；省略时使用 HF 默认缓存")
     model.add_argument("--repo", required=True)
     model.add_argument("--revision", required=True)
+    model.add_argument("--load-format", choices=("dummy", "auto"), default="dummy")
     model.add_argument("--output", type=Path, required=True)
     local = sub.add_parser("inspect-model")
     local.add_argument("--directory", type=Path, required=True)
@@ -267,7 +305,7 @@ def main():
     elif args.action == "inspect-model":
         result = dict(inspect_model(args.directory), source="local-readonly", reused=True)
     else:
-        result = prepare_model(args.repo, args.revision, args.directory)
+        result = prepare_model(args.repo, args.revision, args.directory, load_format=args.load_format)
     write_json(args.output, result)
 
 

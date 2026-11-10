@@ -12,8 +12,6 @@ import shutil
 import statistics
 import sys
 
-# 独立客户端需要的全部源码；归档时一起复制，避免拆分后快照无法运行。
-DRIVER_FILES = ("run_experiment.py", "rank_metrics.py", "experiment_results.py", "experiment_diagnostics.py")
 
 # CSV 列名 → SGLang meta_info 字段。服务端时间单位是秒，写 CSV 时转为毫秒。
 # None 表示该项由客户端自己测量，不从服务响应提取。
@@ -40,15 +38,16 @@ FIELDS = [
     "host_tokens", "storage_tokens", "num_retractions", *TIMES,
     "forward_entry_time", "prefill_finished_time", *LOAD_FIELDS, FORWARD_FIELD,
     "tp", "ep", "prefill_forward_passes", "mamba_load_states",
+    "load_format", "routing", "prefill_graph", "prefill_graph_passes", "prefill_eager_passes",
     "device_tokens_before", "host_backed_tokens_before",
     "device_used_tokens_before", "host_used_tokens_before",
     "device_used_tokens_after", "host_used_tokens_after", "output_ids", "profiled", *ENV_FIELDS, "valid", "invalid_reason",
 ]
 
 
-def write_json(path, value):
-    """保存缩进后的 JSON，便于直接打开检查参数和原始输入。"""
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+def mode_label(config):
+    modes = config.get("benchmark_modes", {})
+    return " / ".join(str(modes.get(k, "unknown")) for k in ("load_format", "routing", "prefill_graph"))
 
 
 def percentile(values, fraction):
@@ -173,7 +172,7 @@ def analyze(directory, no_plot=False):
             status += "; PROFILER ENABLED (diagnostic only)"
         note = config["arguments"].get("note", "")
         title = f"{config.get('model', 'model')} — run: {status}; complete groups only"
-        fig.suptitle(title + ("\n" + note if note else ""))
+        fig.suptitle(title + "\n" + mode_label(config) + ("\n" + note if note else ""))
         fig.tight_layout()
         fig.savefig(directory / "latency.png", dpi=160)
         plt.close(fig)
@@ -219,7 +218,7 @@ def plot_timing(directory, config, summaries, plt):
             ax.legend()
     note = config["arguments"].get("note", "")
     title = "Median / P95 stream intervals; H2D and forward may overlap"
-    fig.suptitle(title + ("\n" + note if note else ""))
+    fig.suptitle(title + "\n" + mode_label(config) + ("\n" + note if note else ""))
     fig.tight_layout()
     fig.savefig(directory / "timing.png", dpi=160)
     plt.close(fig)
@@ -252,7 +251,7 @@ def plot_heatmaps(directory, config, summaries, plt):
                         ax.text(j, i, f"{value:.1f}", ha="center", va="center", fontsize=7,
                                 color="white" if chart.norm(value) < .6 else "black")
             fig.colorbar(chart, ax=ax, label="ms (log color scale)")
-            fig.suptitle(f"L1 {metric} — {statistic}\n" + config["arguments"].get("note", ""))
+            fig.suptitle(f"L1 {metric} — {statistic}\n" + mode_label(config) + "\n" + config["arguments"].get("note", ""))
             fig.tight_layout()
             fig.savefig(directory / f"{metric}_{statistic}_heatmap.png", dpi=160)
             plt.close(fig)

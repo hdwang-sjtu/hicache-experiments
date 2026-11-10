@@ -15,19 +15,21 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
-from experiment_results import DRIVER_FILES
+from hicache.metadata import code_files
+DRIVER_FILES = code_files()
 
 
 class Launchers(unittest.TestCase):
     def test_frozen_launch_needs_no_profiles_and_reuses_code_archive(self):
-        from run_all import CODE_FILES
-        import serve_config
+        from hicache.runner import CODE_FILES
+        from hicache import config as serve_config
         task = self.root / 'managed-result'
         code = task / 'code'
         code.mkdir(parents=True)
         for name in CODE_FILES:
+            (code / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(PROJECT / name, code / name)
-        resolution = serve_config.resolve('qwen3-8b-4k', 'native', [], self.env)
+        resolution = serve_config.resolve('qwen3-8b-smoke', 'native', [], self.env)
         resolution['server']['context-length'] = 135168
         resolution['server_yaml'] = serve_config.yaml_module().safe_dump(resolution['server'])
         frozen = task / 'resolved-serve.json'
@@ -96,7 +98,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
                               text=True, capture_output=True, timeout=15)
 
     def test_native_records_actual_command_and_failure(self):
-        result = self.run_script("serve.sh", "qwen3-8b-4k", "--json-model-override-args", '{"max_position_embeddings":135168}',
+        result = self.run_script("serve.sh", "qwen3-8b-smoke", "--json-model-override-args", '{"max_position_embeddings":135168}',
                                  FAKE_EXIT="7", GPU="2", HICACHE="1", FORWARD_TIMING="1")
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertIn("fake server started", result.stdout)
@@ -109,7 +111,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         self.assertTrue((self.root / "results/test/launch-source/serve.sh").exists())
         # 重复启动不得覆盖记录，也不应再次运行模型进程。
         (self.root / "capture.json").unlink()
-        self.assertNotEqual(self.run_script("serve.sh", "qwen3-8b-4k").returncode, 0)
+        self.assertNotEqual(self.run_script("serve.sh", "qwen3-8b-smoke").returncode, 0)
         self.assertFalse((self.root / "capture.json").exists())
 
 
@@ -131,7 +133,7 @@ elif command[0] == 'wait': print('17')
 
     def test_named_native_profile_snapshot_and_cli_override(self):
         literal = json.dumps({"text": "$(touch SHOULD_NOT_EXIST); `echo nope`", "max_position_embeddings": 4096})
-        result = self.run_script("serve.sh", "qwen3-8b-4k", "--mem-fraction-static", "0.85",
+        result = self.run_script("serve.sh", "qwen3-8b-smoke", "--mem-fraction-static", "0.85",
                                  "--json-model-override-args", literal, MEM_FRACTION="0.75")
         self.assertEqual(result.returncode, 0, result.stderr)
         directory = self.root / "results/test"
@@ -144,7 +146,7 @@ elif command[0] == 'wait': print('17')
         self.assertEqual(resolution["server"]["mem-fraction-static"], .75)
         self.assertEqual(resolution["server"]["model-path"], str(self.model))
         manifest = json.loads((directory / "launch.json").read_text())
-        raw = (PROJECT / "configs/serve/qwen3-8b-4k.yaml").read_bytes()
+        raw = (PROJECT / "configs/experiments/qwen3-8b-smoke.yaml").read_bytes()
         self.assertEqual((directory / "profile.yaml").read_bytes(), raw)
         self.assertEqual(manifest["profile"]["source_sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(manifest["profile"]["server_config_sha256"],
@@ -158,7 +160,7 @@ elif command[0] == 'wait': print('17')
 
     def test_named_docker_profile_freezes_config_and_rewrites_model(self):
         log = self.fake_docker()
-        result = self.run_script("launch_server.sh", "qwen3-8b-4k", "--model", str(self.model),
+        result = self.run_script("launch_server.sh", "qwen3-8b-smoke", "--model", str(self.model),
                                  "--mem-fraction-static", "0.85", FAKE_DOCKER_LOG=str(log))
         self.assertEqual(result.returncode, 17, result.stderr)
         directory = self.root / "results/test"
@@ -192,7 +194,7 @@ elif command[0] == 'wait': print('17')
                 run_id = 'hf-shared' if shared else 'hf-legacy'
                 self.fake_docker()
                 log = self.root/(run_id + '.jsonl')
-                result = self.run_script('launch_server.sh', 'qwen3-8b-4k',
+                result = self.run_script('launch_server.sh', 'qwen3-8b-smoke',
                                          MODEL_DIR=str(snapshot), RUN_ID=run_id, FAKE_DOCKER_LOG=str(log))
                 self.assertEqual(result.returncode, 17, result.stderr)
                 calls = [json.loads(line) for line in log.read_text().splitlines()]
@@ -211,6 +213,7 @@ class RemoteClient(unittest.TestCase):
         self.root = Path(self.temp.name)
         # 只复制客户端，不提供 serve.sh、Docker、SGLang 或模型权重。
         for name in DRIVER_FILES:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(PROJECT / name, self.root / name)
         (self.root / "transformers.py").write_text('''
 class AutoTokenizer:
@@ -295,7 +298,7 @@ class AutoTokenizer:
             rows = list(csv.DictReader(file))
         self.assertEqual(len(rows), 16)
         self.assertTrue(all(row["valid"] == "True" for row in rows))
-        self.assertEqual(sorted(p.name for p in (self.root / "results/source").iterdir()), sorted(DRIVER_FILES))
+        self.assertEqual(sorted(str(p.relative_to(self.root / "results/source")) for p in (self.root / "results/source").rglob("*") if p.is_file() and "__pycache__" not in p.parts), sorted(DRIVER_FILES))
 
     def test_managed_client_references_existing_evidence_without_copying(self):
         code, server = self.root / 'code', self.root / 'server'
@@ -304,8 +307,10 @@ class AutoTokenizer:
         server.mkdir()
         alias.mkdir()
         for name in DRIVER_FILES:
+            (code / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(PROJECT / name, code / name)
             # 模拟 Docker 的双重 bind mount：路径不同，底层文件身份相同。
+            (alias / name).parent.mkdir(parents=True, exist_ok=True)
             (alias / name).hardlink_to(code / name)
         shutil.copyfile(self.root / 'transformers.py', alias / 'transformers.py')
         (server / 'launch.json').write_text('{"runtime":"native"}')
@@ -320,6 +325,18 @@ class AutoTokenizer:
         self.assertEqual(config['server_log_path'], '../server/server.log')
         for name in ('source', 'launch.json', 'server.log', 'all_cache_valid_summary.csv'):
             self.assertFalse((directory / name).exists(), name)
+
+    def test_remote_client_needs_no_launcher_files(self):
+        for name in ('serve.sh', 'launch_server.sh', 'run_all.py'):
+            (self.root / name).unlink()
+        shutil.rmtree(self.root / 'configs')
+        shutil.rmtree(self.root / 'patches')
+        result = self.run_client()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archived = self.root / 'results/source'
+        self.assertTrue((archived / 'run_experiment.py').is_file())
+        self.assertTrue((archived / 'hicache/benchmark.py').is_file())
+        self.assertFalse((archived / 'serve.sh').exists())
 
     def test_profile_path_belongs_to_server_and_artifacts_are_optional_copies(self):
         artifacts = self.root / "copied-launch"

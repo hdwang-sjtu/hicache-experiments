@@ -8,11 +8,11 @@
 
 `serve.sh` 读取命名 YAML 或总控已解析配置：读取配置 → 组装 SGLang 命令 → 保存启动记录 → exec 服务进程。
 `launch_server.sh` 负责 Docker 镜像、挂载和生命周期，在容器内调用 `serve.sh`。
-常用服务参数保存在 `configs/serve/`，通过共用的 `serve_config.py` 解析，默认值只在 YAML 中定义。
+常用服务参数保存在 `configs/experiments/`，通过共用的 `hicache/config.py` 解析，默认值只在 YAML 中定义。
 修改挂载时看 `launch_server.sh` 的 `docker_args`。
-两者通过内部工具 `launch_metadata.py` 保存记录。已有 Python 环境直接用 `serve.sh`，不需要 Docker。
+两者通过内部工具 `hicache/metadata.py` 保存记录。已有 Python 环境直接用 `serve.sh`，不需要 Docker。
 
-`run_experiment.py` 可以按下面的调用顺序阅读：
+`run_experiment.py` 是薄入口，采样实现在 `hicache/benchmark.py`，可以按下面的调用顺序阅读：
 
 ```text
 main()                       解析 run / analyze 等子命令
@@ -23,10 +23,10 @@ main()                       解析 run / analyze 等子命令
     │   └── execute_sample() 清空缓存 → 按组准备 → 测量 → 校验
     │       ├── Client      发送 HTTP 请求并保存原始响应
     │       └── validate()  检查长度、各层命中、回撤和时间字段
-    └── experiment_results  过滤无效样本，输出 Median、P95 和图表
+    └── hicache.results  过滤无效样本，输出 Median、P95 和图表
 ```
 
-`rank_metrics.py` 集中处理所有 rank 的指标；`experiment_diagnostics.py` 保存可选遥测和 trace 分析。模拟测试集中在 `tests/`，运行 `python3 -m unittest discover -s tests`。
+`hicache/metrics.py` 集中处理所有 rank 的指标；`tools/diagnostics.py` 保存可选遥测和 trace 分析。模拟测试集中在 `tests/`，运行 `python3 -m unittest discover -s tests`。
 
 有两种容易混淆的“预热”：`warmup` 是每个长度组合开始时的运行预热，不写入测量 CSV；`prepare` 是每一次 L1 样本都必须重新做的 P 请求，用来构造缓存状态。
 `measure` 才是计入 CSV 的 P+S 请求，且其清空和准备耗时不计入客户端测量延迟。
@@ -42,7 +42,7 @@ main()                       解析 run / analyze 等子命令
 ```bash
 cd /path/to/hicache-experiments
 export MODEL_DIR=/path/to/Qwen3-8B
-CONTEXT_LENGTH=40960 MAX_TOTAL_TOKENS=36864 GPU=3 HICACHE=1 RUN_ID=l2-demo CONTAINER_NAME=hicache-l2 bash launch_server.sh qwen3-8b-4k
+CONTEXT_LENGTH=40960 MAX_TOTAL_TOKENS=36864 GPU=3 HICACHE=1 RUN_ID=l2-demo CONTAINER_NAME=hicache-l2 bash launch_server.sh qwen3-8b-smoke
 ```
 
 `HICACHE=1` 固定 Python TreeCore，开启 CPU 持久缓存、`write_through` 和本地实验接口；CPU KV 池默认 8 GB（十进制，约 7.45 GiB），可用 `HICACHE_SIZE` 修改。没有启用 L3。
@@ -97,12 +97,12 @@ JSON/IPC 传入的 token IDs 是 `list`；接口在匹配前转换为 serving �
 
 ```bash
 GPU=1 MODEL_DIR=/path/to/local/model DTYPE=bfloat16 KV_DTYPE=bfloat16 \
-  RUN_ID=another-model bash launch_server.sh qwen3-8b-4k
+  RUN_ID=another-model bash launch_server.sh qwen3-8b-smoke
 ```
 
 可覆盖 `SGLANG_DIR`、`IMAGE`、`PORT`、`CONTEXT_LENGTH`、`MAX_TOTAL_TOKENS`、`MEM_FRACTION`、`RESULTS_DIR`。
 `TP`/`EP` 是启动参数；Driver 支持 TP=1/2/4、EP=1/TP，要求 PP=DP=1。多 rank 必须启用所有 scheduler 指标与 GPU timing。
-`qwen3-8b-4k` 默认总上下文 4096、KV 槽位 8192，适合 P=2K 小点。本文 8K/32K 示例显式扩大了上下文和 KV 容量；并发 1、Graph 关闭、chunk 4096 等设置仍来自 YAML。
+`qwen3-8b-smoke` 默认总上下文 4096、KV 槽位 8192，适合 P=2K 小点。本文 8K/32K 示例显式扩大了上下文和 KV 容量；并发 1、Graph 关闭、chunk 4096 等设置仍来自 YAML。
 其他模型需自行设置正确上下文长度，dtype 必须由模型及所用后端支持。
 
 ## GPU 计时和 Profiler
@@ -116,7 +116,7 @@ GPU=1 MODEL_DIR=/path/to/local/model DTYPE=bfloat16 KV_DTYPE=bfloat16 \
 ```bash
 MODEL_DIR=/path/to/Qwen3-8B CONTEXT_LENGTH=40960 MAX_TOTAL_TOKENS=36864 \
   GPU=1 HICACHE=1 FORWARD_TIMING=1 RUN_ID=timing-demo \
-  CONTAINER_NAME=hicache-timing bash launch_server.sh qwen3-8b-4k
+  CONTAINER_NAME=hicache-timing bash launch_server.sh qwen3-8b-smoke
 ```
 
 第二个终端先采集诊断时间线，缓存准备与逐出不进入 Profiler 区间：
@@ -133,7 +133,7 @@ docker exec --user "$(id -u):$(id -g)" hicache-timing \
 docker cp hicache-timing:/tmp/hicache-profile-demo results/profile-demo/traces
 
 docker exec --user "$(id -u):$(id -g)" hicache-timing \
-  python /experiment/run_experiment.py analyze-traces /results/profile-demo
+  python /experiment/-m tools.diagnostics analyze-traces /results/profile-demo
 ```
 
 `--profile` 只开启测量请求期间的原生 `/start_profile` / `/stop_profile`，预热、备份和 demote 在区间外。
@@ -174,8 +174,8 @@ docker exec --user "$(id -u):$(id -g)" hicache-timing \
 先按下文准备采样目录和 `owner.json`，再在宿主机的两个终端分别启动采样（`TELEMETRY_DIR` 替换为实际宿主机路径）：
 
 ```bash
-python3 run_experiment.py monitor --kind gpu --output-dir "$TELEMETRY_DIR" --interval 1
-python3 run_experiment.py monitor --kind host --output-dir "$TELEMETRY_DIR" --interval 1
+python3 -m tools.diagnostics monitor --kind gpu --output-dir "$TELEMETRY_DIR" --interval 1
+python3 -m tools.diagnostics monitor --kind host --output-dir "$TELEMETRY_DIR" --interval 1
 ```
 
 使用监控前，先创建 `owner.json`，填写选定物理 GPU 编号、专用容器允许的 PID，以及 Scheduler PID。需要在宿主机用 `docker top <container> -eo pid,args` 核对进程归属，不应把其他任务加入允许清单。
@@ -285,3 +285,13 @@ Median 和 P95 仅对有效样本计算；P95 使用排序后线性插值。少�
 一个服务可对应多个测量目录，后续目录关联原始启动信息；没有启动证据时无法证明镜像和源码版本。
 
 混合注意力、多 rank 的状态与指标规则见 [Qwen3.5 实验](qwen35.md)。旧记录中的 P+S₀ 方法属于当时的 FULL-KV 实验，新入口使用独立 P 准备。
+
+## 随机权重和 Graph 记录
+
+默认 dummy + round-robin + breakable；真实权重使用 --load-format auto，原始路由使用 --routing original，eager 使用 --prefill-graph disabled。统一实验 YAML 的 server 区域保存这些模式。服务端保留完整模型结构和量化配置，dummy 只省去权重下载/读取。
+
+Graph 桶由正式测量的逻辑 forward 长度生成：L1/L2 为 S，cold 为固定 chunk 切分后的 P+S。reference/prepare 允许 eager，正式请求必须逐 rank 满足所选模式。prefill_forward_passes 为总数，prefill_graph_passes 与 prefill_eager_passes 记录两种路径。计划桶写在配置中，不冒充直接观测到的桶编号。
+
+CSV 另记录 load_format、routing、prefill_graph；历史 CSV 缺失时为 unknown，不补成新默认。mode 标记同时显示在新图表中。
+
+inputs.json 的 schema_version=2 保存 prefix_unit、suffix_unit 和各组合长度/哈希。将对应 unit 重复并截取到 P/S 即可重建原始请求；不再按每个组合重复保存完整长前缀。
