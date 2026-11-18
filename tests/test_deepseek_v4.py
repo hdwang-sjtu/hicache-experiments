@@ -4,6 +4,7 @@ from array import array
 from contextlib import redirect_stdout
 from copy import deepcopy
 from enum import Enum, auto
+import functools
 import importlib.util
 import io
 import json
@@ -43,6 +44,58 @@ class V4Configuration(unittest.TestCase):
                         dict(context_length=2048), dict(suffix_lengths=[65536])):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.job(**options)
+
+
+class FlashMLACompatibility(unittest.TestCase):
+    def setUp(self):
+        self.load_module = Mock()
+        self.load = added_function(
+            "_load_flashmla",
+            dict(import_module=self.load_module, functools=functools, logger=Mock()),
+        )
+
+    def test_bundled_extension_keeps_its_original_api(self):
+        bundled = Mock(__name__="sgl_kernel.flash_mla")
+        self.load_module.return_value = bundled
+        self.assertEqual(
+            self.load(),
+            (bundled.get_mla_metadata, bundled.flash_mla_with_kvcache, bundled.flash_mla_sparse_fwd),
+        )
+        bundled.get_mla_metadata.assert_called_once_with()
+        self.load_module.assert_called_once_with("sgl_kernel.flash_mla")
+
+    def test_standalone_extension_uses_legacy_kernels(self):
+        standalone = Mock(__name__="flash_mla.flash_mla_interface")
+        self.load_module.side_effect = [
+            ModuleNotFoundError(name="sgl_kernel.flash_mla"), standalone,
+        ]
+        metadata, decode, prefill = self.load()
+        self.assertIs(metadata, standalone.get_mla_metadata)
+        standalone.get_ops.assert_called_once_with(use_legacy=True)
+        decode(q="decode")
+        prefill(q="prefill")
+        standalone.flash_mla_with_kvcache.assert_called_once_with(q="decode", use_legacy=True)
+        standalone.flash_mla_sparse_fwd.assert_called_once_with(
+            q="prefill", use_legacy=True, return_log2_lse=True,
+        )
+
+    def test_legacy_extension_load_failure_keeps_the_cause(self):
+        standalone = Mock(__name__="flash_mla.flash_mla_interface")
+        cause = OSError("legacy extension ABI mismatch")
+        standalone.get_ops.side_effect = cause
+        self.load_module.side_effect = [
+            ModuleNotFoundError(name="sgl_kernel.flash_mla"), standalone,
+        ]
+        with self.assertRaisesRegex(ImportError, "legacy sparse kernels") as error:
+            self.load()
+        self.assertIs(error.exception.__cause__, cause)
+
+    def test_missing_dependency_of_bundled_extension_does_not_switch_api(self):
+        self.load_module.side_effect = ModuleNotFoundError("missing module", name="torch")
+        with self.assertRaises(ModuleNotFoundError) as error:
+            self.load()
+        self.assertEqual(error.exception.name, "torch")
+        self.load_module.assert_called_once_with("sgl_kernel.flash_mla")
 
 
 class DeviceInspection(unittest.TestCase):

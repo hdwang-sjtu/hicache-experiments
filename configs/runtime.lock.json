@@ -3,5 +3,5 @@
   "sglang_repository": "https://github.com/sgl-project/sglang.git",
   "sglang_base": "baa9befa381511cd4d56f83980951e5a45fffc6d",
   "patch": "patches/sglang-hicache-experiment.patch",
-  "patch_sha256": "68c788091747d47c03dd4aaacb74efdb680287c579678790e51f75d233adf150"
+  "patch_sha256": "640848bf3b7c6814d390d5659a30abc2024e9e9ef5164a0352245e38bb9bcc5c"
 }

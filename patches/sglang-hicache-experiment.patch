@@ -61,6 +61,87 @@ index 7165a5ca8c3cceea29b66862bf27f3a2a97c9fae..292b38f5b08567c28eeceb752be9cbb6
  @app.post("/add_external_corpus")
  @auth_level(AuthLevel.ADMIN_OPTIONAL)
  async def add_external_corpus(request: Request):
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 32e34d2ae0c4f4bc50ae3a4e54bdc1f574f47d99..377fab2436d0f2c5113119cd31069f842150e2fc 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -4,6 +4,7 @@ import enum
+ import functools
+ import logging
+ from dataclasses import dataclass, field
++from importlib import import_module
+ from typing import (
+     TYPE_CHECKING,
+     Dict,
+@@ -184,12 +185,47 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
+     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+ 
+ 
++@functools.lru_cache(maxsize=1)
++def _load_flashmla():
++    """Select one FlashMLA API for metadata and both V4 attention paths."""
++    try:
++        flash_mla = import_module("sgl_kernel.flash_mla")
++    except ModuleNotFoundError as exc:
++        if exc.name not in ("sgl_kernel", "sgl_kernel.flash_mla"):
++            raise
++    else:
++        # The old Python module defers extension-load errors to this call.
++        flash_mla.get_mla_metadata()
++        logger.info("DeepSeek V4 FlashMLA: %s (bundled legacy kernels)", flash_mla.__name__)
++        return (
++            flash_mla.get_mla_metadata,
++            flash_mla.flash_mla_with_kvcache,
++            flash_mla.flash_mla_sparse_fwd,
++        )
++
++    try:
++        flash_mla = import_module("flash_mla.flash_mla_interface")
++        ops = flash_mla.get_ops(use_legacy=True)
++        if not callable(ops.sparse_decode_fwd) or not callable(ops.sparse_prefill_fwd):
++            raise ImportError("legacy sparse FlashMLA ops are unavailable")
++        decode = functools.partial(flash_mla.flash_mla_with_kvcache, use_legacy=True)
++        prefill = functools.partial(
++            flash_mla.flash_mla_sparse_fwd, use_legacy=True, return_log2_lse=True
++        )
++    except (ImportError, OSError, AttributeError, RuntimeError) as exc:
++        raise ImportError(
++            "DeepSeek V4 requires a FlashMLA extension with legacy sparse kernels. "
++            "Install a compatible SGLang runtime."
++        ) from exc
++    logger.info("DeepSeek V4 FlashMLA: %s (use_legacy=True)", flash_mla.__name__)
++    return flash_mla.get_mla_metadata, decode, prefill
++
++
+ def _create_flashmla_metadata():
+     if get_platform().is_sm120 or _is_xpu:
+         return None
+-    import sgl_kernel.flash_mla as flash_mla
+-
+-    return flash_mla.get_mla_metadata()[0]
++    get_mla_metadata, _, _ = _load_flashmla()
++    return get_mla_metadata()[0]
+ 
+ 
+ # FlashMLA's head64 sm100 decode scheduling constants; not exported, so they hold
+@@ -3812,7 +3848,7 @@ class DeepseekV4AttnBackend(
+                 if _is_xpu:
+                     from sgl_kernel import flash_mla_with_kvcache
+                 else:
+-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
++                    _, flash_mla_with_kvcache, _ = _load_flashmla()
+ 
+                 if self.is_dsv41:
+                     _maybe_precompute_flashmla_sched_meta(
+@@ -3860,7 +3896,7 @@ class DeepseekV4AttnBackend(
+         if _is_xpu:
+             from sgl_kernel import flash_mla_sparse_fwd
+         else:
+-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
++            _, _, flash_mla_sparse_fwd = _load_flashmla()
+ 
+         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
+         q_flat = q.squeeze(1)
 diff --git a/python/sglang/srt/layers/moe/hash_topk.py b/python/sglang/srt/layers/moe/hash_topk.py
 index d32c600ff200cfb880b64bf5ce9505775e24a8b4..e952271988e1f89c959a42ce681bdcf541c96b56 100644
 --- a/python/sglang/srt/layers/moe/hash_topk.py
@@ -659,6 +740,37 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..6038d5104cb74023d24b59e5994465b7
      def _drop_subtree_no_host(
          self, node_id: NodeId, tracker: dict[ComponentType, int]
      ) -> bool:
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index e3618f516f55ff8ca727a4fb3b17788e66a7a330..5f3b15436129d9d4a7a614f46e6f2feb47f11098 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -34,6 +34,7 @@ from sglang.srt.configs.model_config import (
+     AttentionArch,
+     ModelConfig,
+     ModelImpl,
++    is_deepseek_v4,
+ )
+ from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
+ from sglang.srt.debug_utils.dumper import dumper
+@@ -193,6 +194,7 @@ from sglang.srt.runtime_context import (
+     get_model,
+     get_observability,
+     get_parallel,
++    get_platform,
+     get_schedule,
+     get_spec,
+     max_speculative_num_draft_tokens,
+@@ -693,6 +695,10 @@ class ModelRunner:
+             )
+ 
+     def initialize(self):
++        if get_platform().is_sm90 and is_deepseek_v4(self.model_config.hf_config):
++            from sglang.srt.layers.attention.deepseek_v4_backend import _load_flashmla
++
++            _load_flashmla()
+         self.init_memory_saver_adapter()
+         self.maybe_init_remote_instance_transfer_engine()
+         self.maybe_init_expert_location_metadata()
 diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
 index 9fc65d822b10cadd3da88563ad8e0ca4028a1634..b64ee025dacd2dcc8cb0a192ac7b2b24f68d0eb5 100644
 --- a/python/sglang/srt/model_loader/weight_utils.py
