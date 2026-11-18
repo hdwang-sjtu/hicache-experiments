@@ -17,6 +17,8 @@
 
 先加 --dry-run 可检查最终配置，不下载、不启动、不写目录。只有 Docker 的宿主机增加 --runtime docker，可用 --image lmsysorg/sglang:dev 选择本地镜像。
 
+DeepSeek V4 Flash 使用 `deepseek-v4-flash` 配置，第一版测无 CPU 缓存的 cold/L1，支持同一 P 复用。双 H200 的 GPU 验收尚未完成，先按 [V4 运行步骤](docs/deepseek-v4.md) 验证 eager，再验证 Graph 和长输入容量。
+
 [仓库结构](docs/architecture.md) · [云实例运行](docs/cloud-task.md) · [分步部署](docs/deployment.md) · [协议与指标](docs/usage.md) · [Qwen3.5](docs/qwen35.md) · [历史记录](docs/experiments/README.md)
 
 ## 选择测量模式

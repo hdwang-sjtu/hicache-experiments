@@ -22,7 +22,8 @@ import yaml
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 from hicache.prepare import docker_model_mount, inspect_model, prepare_model
-from hicache.runner import CODE_FILES, Job, verify_results
+from hicache.metadata import snapshot_code
+from hicache.runner import Job, verify_results
 
 # 提供就绪状态和任务身份，供真实总控轮询；不加载模型、不访问 GPU。
 SERVER = '''#!/bin/bash
@@ -34,8 +35,13 @@ if mode=='crash': sys.exit(7)
 resolution=json.load(open(sys.argv[sys.argv.index('--resolved-profile')+1]))
 identity=resolution['cli_args'][1]
 class Handler(BaseHTTPRequestHandler):
+    disconnected = False
     def log_message(self,*_): pass
     def do_GET(self):
+        if mode=='success' and not Handler.disconnected:
+            # 第一个就绪探测在 HTTP 响应前断开，后续探测应继续。
+            Handler.disconnected = True
+            return
         self.send_response(503 if mode=='timeout' else 200)
         self.end_headers()
         self.wfile.write(json.dumps({'served_model_name':identity}).encode())
@@ -79,11 +85,7 @@ class TaskFlow(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.project = self.root/'project'
         self.project.mkdir()
-        for name in CODE_FILES:
-            (self.project / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(PROJECT/name, self.project/name)
-        for name in ('configs','patches'):
-            shutil.copytree(PROJECT/name,self.project/name,dirs_exist_ok=True)
+        snapshot_code(self.project)
         (self.project/'serve.sh').write_text(SERVER)
         experiment=yaml.safe_load((self.project/'configs/experiments/qwen3-8b-smoke.yaml').read_text())
         experiment['test'].update(groups=['cold'],repeats=1,**{'gpu-timing':False,'no-plot':True,'ready-timeout':1})
@@ -109,7 +111,9 @@ class TaskFlow(unittest.TestCase):
                 self.assertEqual(state['status'],'complete' if code==0 else ('interrupted' if code==143 else 'failed'))
                 self.assertEqual(state.get('failed_phase'),phase)
                 self.assertFalse(job.active_processes)
-                self.assertTrue(all(p.poll() is not None for p in job.processes))
+                for child in state.get("processes", []):
+                    with self.assertRaises(ChildProcessError):  # 子进程已 wait 回收。
+                        os.waitpid(child["pid"], os.WNOHANG)
                 if mode=='test-fail': self.assertTrue((job.root/'samples/partial.txt').exists())
                 if mode=='success':
                     self.assertEqual(state['validation']['valid_samples'],1)
@@ -124,7 +128,7 @@ class TaskFlow(unittest.TestCase):
             job=self.job('occupied')
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(job.execute(),1)
-            self.assertFalse(job.processes)
+            self.assertFalse(job.state.get("processes"))
             self.assertGreater(listener.fileno(),0)
         job=self.job('cleanup-docker')
         job.args.runtime='docker'

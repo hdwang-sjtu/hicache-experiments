@@ -85,12 +85,14 @@ class SyntheticConfiguration(unittest.TestCase):
             all_special_ids = []
             def encode(self, text, **_): return list(text.encode())
         tokenizer = Tokenizer()
-        cases = benchmark.make_cases(tokenizer, [2048, 4096], [128, 256], 'fixed')
-        saved = benchmark.input_manifest(tokenizer, cases, 'fixed')
-        for case in saved['cases']:
-            ids = (benchmark.tile(saved['prefix_unit'], case['prefix_length']) +
-                   benchmark.tile(saved['suffix_unit'], case['suffix_length']))
-            self.assertEqual(benchmark.digest(ids), case['input_sha256'])
+        with patch.object(tokenizer, 'encode', wraps=tokenizer.encode) as encode:
+            cases, saved = benchmark.make_cases(tokenizer, [2048, 4096], [128, 256], 'fixed')
+        self.assertEqual(encode.call_count, 2)
+        for case, entry in zip(cases, saved['cases'], strict=True):
+            ids = (benchmark.tile(saved['prefix_unit'], entry['prefix_length']) +
+                   benchmark.tile(saved['suffix_unit'], entry['suffix_length']))
+            self.assertEqual(ids, case['prefix'] + case['suffix'])
+            self.assertEqual(benchmark.digest(ids), entry['input_sha256'])
         self.assertLess(len(json.dumps(saved)), len(json.dumps(cases)) // 5)
 
 

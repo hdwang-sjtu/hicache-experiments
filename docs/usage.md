@@ -21,9 +21,10 @@ main()                       解析 run / analyze 等子命令
     ├── check_server()       检查 TP/EP、单请求、上下文长度和 KV 容量
     ├── run_samples()        每个 P 先做 cold/reference，再准备 P 并跨 S 采样
     │   ├── prepare_prefix() 清空 → 计算 P → 等备份并记录池占用基线
-    │   └── execute_sample() 检查/降级 P → 测量 → 校验并检查状态回收
-    │       ├── Client      发送 HTTP 请求并保存原始响应
-    │       └── validate()  检查长度、各层命中、回撤和时间字段
+    │   └── collect_case()   单个 P/S 的预热、重复和无效重试
+    │       └── execute_sample() 检查/降级 P → 测量 → 校验并检查状态回收
+    │           ├── Client       发送 HTTP 请求并保存原始响应
+    │           └── validate()   检查长度、各层命中、回撤和时间字段
     └── hicache.results  过滤无效样本，输出 Median、P95 和图表
 ```
 
@@ -134,7 +135,7 @@ docker exec --user "$(id -u):$(id -g)" hicache-timing \
 docker cp hicache-timing:/tmp/hicache-profile-demo results/profile-demo/traces
 
 docker exec --user "$(id -u):$(id -g)" hicache-timing \
-  python /experiment/-m tools.diagnostics analyze-traces /results/profile-demo
+  python -m tools.diagnostics analyze-traces /results/profile-demo
 ```
 
 `--profile` 只开启测量请求期间的原生 `/start_profile` / `/stop_profile`，预热、备份和 demote 在区间外。
@@ -293,6 +294,8 @@ Median 和 P95 仅对有效样本计算；P95 使用排序后线性插值。少�
 混合注意力、多 rank 的状态与指标规则见 [Qwen3.5 实验](qwen35.md)。旧记录中的 P+S₀ 方法属于当时的 FULL-KV 实验，新入口使用独立 P 准备。
 
 ## 随机权重和 Graph 记录
+
+DeepSeek V4 Flash 的首版是无 HiCache 的 cold/L1 路径，仍通过实验接口检查所有 rank 空闲、真实前缀命中与 GPU 池基线。逐 rank 指标只要求 forward/token/Graph 证据，不要求不存在的 H2D counter；恢复时间、字节数等 CSV 列留空。配置、运行方法和 GPU 验收边界见 [DeepSeek V4](deepseek-v4.md)。
 
 默认 dummy + round-robin + breakable；真实权重使用 --load-format auto，原始路由使用 --routing original，eager 使用 --prefill-graph disabled。统一实验 YAML 的 server 区域保存这些模式。服务端保留完整模型结构和量化配置，dummy 只省去权重下载/读取。
 

@@ -8,11 +8,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from hicache import benchmark
 from hicache.config import build_run_parser
-from hicache.results import FIELDS
+from hicache.results import FIELDS, summarize_rows
 from hicache.runner import test_arguments, verify_results
 
 
@@ -76,7 +76,8 @@ class Cache:
             self.corrupt = True
             if self.fault == 'suffix':
                 self.cached, self.backed = ids.copy(), ids.copy()
-        return dict(output_ids=[sum(ids) % 97] * output_length, meta_info=dict(
+        token = 999 if self.fault == 'output' and host > device and stage == 'measure' else sum(ids) % 97
+        return dict(output_ids=[token] * output_length, meta_info=dict(
             prompt_tokens=len(ids), completion_tokens=output_length,
             cached_tokens=max(device, host),
             cached_tokens_details=dict(device=device, host=max(host-device, 0), storage=0),
@@ -149,6 +150,33 @@ class PrefixReuse(unittest.TestCase):
             rows = list(csv.DictReader(io.StringIO(self.stream.getvalue())))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]['valid'], 'False')
+
+    def test_l2_with_wrong_output_is_saved_as_invalid(self):
+        self.args.groups = ['l2']
+        self.args.repeats = self.args.max_attempts = 1
+        with self.assertRaisesRegex(RuntimeError, 'insufficient valid samples'):
+            self.run_cache(Cache(fault='output'))
+        row, = csv.DictReader(io.StringIO(self.stream.getvalue()))
+        self.assertEqual((row['group'], row['host_tokens'], row['cache_valid']), ('l2', '8', 'False'))
+        self.assertEqual(row['valid'], 'False')
+        self.assertIn('token', row['invalid_reason'])
+
+    def test_telemetry_gap_retries_and_preserves_cache_valid_sample(self):
+        self.args.groups = ['l1']
+        self.args.repeats = 1
+        self.cases = self.cases[:1]
+        client = Cache()
+        client.environment = Mock()
+        client.environment.evaluate.side_effect = [
+            dict(environment_valid=False, environment_reason='injected gap'),
+            dict(environment_valid=True, environment_reason=''),
+        ]
+        rows = self.run_cache(client)
+        self.assertEqual([(r['attempt'], r['valid'], r['cache_valid']) for r in rows],
+                         [('1', 'False', 'True'), ('2', 'True', 'True')])
+        for column, expected in [('valid', 1), ('cache_valid', 2)]:
+            summary = summarize_rows(rows, dict(arguments=vars(self.args)), ['client_latency_ms'], column)
+            self.assertEqual(summary[0]['valid'], expected)
 
     def test_cli_yaml_and_http_flag(self):
         parser, _ = build_run_parser()

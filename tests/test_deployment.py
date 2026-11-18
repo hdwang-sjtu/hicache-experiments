@@ -15,21 +15,19 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
-from hicache.metadata import code_files
-DRIVER_FILES = code_files()
+from hicache.metadata import code_files, snapshot_code
 
 
 class Launchers(unittest.TestCase):
     def test_frozen_launch_needs_no_profiles_and_reuses_code_archive(self):
-        from hicache.runner import CODE_FILES
         from hicache import config as serve_config
         task = self.root / 'managed-result'
         code = task / 'code'
         code.mkdir(parents=True)
-        for name in CODE_FILES:
-            (code / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(PROJECT / name, code / name)
-        resolution = serve_config.resolve('qwen3-8b-smoke', 'native', [], self.env)
+        snapshot_code(code)
+        profile = serve_config.read_profile('qwen3-8b-smoke', code / 'configs/experiments')
+        resolution = serve_config.resolve(profile, 'native', [], self.env)
+        shutil.rmtree(code / 'configs')
         resolution['server']['context-length'] = 135168
         resolution['server_yaml'] = serve_config.yaml_module().safe_dump(resolution['server'])
         frozen = task / 'resolved-serve.json'
@@ -211,10 +209,10 @@ class RemoteClient(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="hicache client ")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        # 只复制客户端，不提供 serve.sh、Docker、SGLang 或模型权重。
-        for name in DRIVER_FILES:
-            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(PROJECT / name, self.root / name)
+        # 独立客户端仅依赖 Python 包和入口，用此布局直接跑 HTTP 矩阵。
+        shutil.copyfile(PROJECT / "run_experiment.py", self.root / "run_experiment.py")
+        for name in ("hicache", "tools"):
+            shutil.copytree(PROJECT / name, self.root / name, ignore=shutil.ignore_patterns("__pycache__"))
         (self.root / "transformers.py").write_text('''
 class AutoTokenizer:
     all_special_ids = []
@@ -298,7 +296,11 @@ class AutoTokenizer:
             rows = list(csv.DictReader(file))
         self.assertEqual(len(rows), 16)
         self.assertTrue(all(row["valid"] == "True" for row in rows))
-        self.assertEqual(sorted(str(p.relative_to(self.root / "results/source")) for p in (self.root / "results/source").rglob("*") if p.is_file() and "__pycache__" not in p.parts), sorted(DRIVER_FILES))
+        archived = self.root / "results/source"
+        files = {str(p.relative_to(archived)) for p in archived.rglob('*') if p.is_file()}
+        self.assertEqual(files, set(code_files(self.root)))
+        self.assertTrue((archived / "hicache/benchmark.py").is_file())
+        self.assertFalse((archived / "serve.sh").exists())
 
     def test_managed_client_references_existing_evidence_without_copying(self):
         code, server = self.root / 'code', self.root / 'server'
@@ -306,9 +308,7 @@ class AutoTokenizer:
         code.mkdir()
         server.mkdir()
         alias.mkdir()
-        for name in DRIVER_FILES:
-            (code / name).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(PROJECT / name, code / name)
+        for name in snapshot_code(code, self.root):
             # 模拟 Docker 的双重 bind mount：路径不同，底层文件身份相同。
             (alias / name).parent.mkdir(parents=True, exist_ok=True)
             (alias / name).hardlink_to(code / name)
@@ -325,18 +325,6 @@ class AutoTokenizer:
         self.assertEqual(config['server_log_path'], '../server/server.log')
         for name in ('source', 'launch.json', 'server.log', 'all_cache_valid_summary.csv'):
             self.assertFalse((directory / name).exists(), name)
-
-    def test_remote_client_needs_no_launcher_files(self):
-        for name in ('serve.sh', 'launch_server.sh', 'run_all.py'):
-            (self.root / name).unlink()
-        shutil.rmtree(self.root / 'configs')
-        shutil.rmtree(self.root / 'patches')
-        result = self.run_client()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        archived = self.root / 'results/source'
-        self.assertTrue((archived / 'run_experiment.py').is_file())
-        self.assertTrue((archived / 'hicache/benchmark.py').is_file())
-        self.assertFalse((archived / 'serve.sh').exists())
 
     def test_profile_path_belongs_to_server_and_artifacts_are_optional_copies(self):
         artifacts = self.root / "copied-launch"

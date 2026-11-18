@@ -19,7 +19,7 @@
 | [hicache/metadata.py](../hicache/metadata.py) | 启动记录与统一包源码快照 |
 | [tools/diagnostics.py](../tools/diagnostics.py) | 可选遥测和 trace 分析 |
 
-修改采样步骤，从 run_samples → execute_sample → validate 读起；修改运行生命周期看 Job.execute。两个 Shell 入口只负责环境和服务进程，不执行采样。
+从 `Job.execute` 看一轮任务如何启动和清理。从 `run_samples` 看每个 P 的 cold、准备和命中顺序，`collect_case` 管一个 P/S 组合的预热与重复，`execute_sample` 发出一次请求并验证结果。
 
 ## 调用关系
 
@@ -68,6 +68,8 @@ HTTP 返回不表示所有 rank 的 CUDA Event 已发布。指标模块检查预
 正式 Graph 请求检查每个 rank 的 Graph/eager 次数；准备和 reference 不要求相同路径。Graph 捕获桶是计划配置，计数器是实际执行证据，二者分别记录。
 
 Qwen3.5 的 P 检查点同时包含 KV 与 GDN 状态，不能仅凭 cached_tokens 推断正确。控制接口、命中、实际计算量与传输验收见 [协议](usage.md)。
+
+DeepSeek V4 的首版 cold/L1 关闭 CPU 缓存，沿用同一个检查接口核对 GPU 的压缩历史、SWA 匹配和池基线；计时不要求 H2D 指标，也不提供 L2。[V4 配置与验收边界](deepseek-v4.md)
 
 Driver 默认每个 P 先完成 cold/reference，再调用 prepare_prefix 建立一次 P，跨 S 执行命中测量。补丁把请求级 skip_radix_cache_insert 传给 serving 已有的 checkpoint/release 逻辑，保留 P 读取和 GDN COW，结束时回收请求私有状态。完整 P+S 匹配及逐 rank 池基线用于检测后缀残留和泄漏。--no-prefix-reuse 使用逐样本准备流程；两种模式都记录在结果中。
 

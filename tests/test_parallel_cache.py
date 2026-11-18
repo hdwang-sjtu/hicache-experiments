@@ -1,6 +1,5 @@
 """Distributed agreement, delayed metrics, checkpoint and capacity failure cases."""
 import argparse
-import ast
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
@@ -18,27 +17,12 @@ import hicache.metrics as metrics
 from hicache.runner import Job
 from hicache.benchmark import Client
 
-PROJECT = Path(__file__).resolve().parents[1]
-
-
-def coordinator():
-    # Test the exact function distributed in the patch, without importing CUDA.
-    lines = (PROJECT / 'patches/sglang-hicache-experiment.patch').read_text().splitlines()
-    index = next(i for i, line in enumerate(lines) if line.startswith('+def coordinate_hicache_experiment('))
-    added = []
-    for line in lines[index:]:
-        if not line.startswith('+'):
-            break
-        added.append(line[1:])
-    tree = ast.parse('\n'.join(added))
-    scope = {}
-    exec(compile(tree, '<bundled scheduler patch>', 'exec'), scope)
-    return scope['coordinate_hicache_experiment']
+from patch_functions import added_function
 
 
 class DistributedControl(unittest.TestCase):
     def scenario(self, *, busy=False, fail_prepare=False, fail_execute=False):
-        function = coordinator()
+        function = added_function('coordinate_hicache_experiment')
         barrier = threading.Barrier(2, timeout=3)
         exchange, actions = {}, []
         def worker(rank):
@@ -152,6 +136,8 @@ class RankEvidence(unittest.TestCase):
         before = {r: dict.fromkeys(v, 0) for r, v in after.items()}
         kwargs = dict(p=256, s=128, group='l2', chunk=256, state=self.state())
         self.assertEqual(len(metrics.metric_delta(before, after, **kwargs)), 2)
+        with self.assertRaisesRegex(RuntimeError, '倒退'):
+            metrics.metric_delta(after, before, **kwargs)
         after[1]['host'] = 0
         with self.assertRaises(metrics.PendingMetrics): metrics.metric_delta(before, after, **kwargs)
         after[1]['host'] = 257
@@ -185,6 +171,7 @@ class RankEvidence(unittest.TestCase):
         with self.assertRaises(metrics.PendingMetrics): metrics.parse_metrics('\n'.join(lines[:-1]), 2, 2, True)
         with self.assertRaises(RuntimeError): metrics.parse_metrics(text+'\n'+lines[0], 2, 2, True)
         with self.assertRaises(RuntimeError): metrics.parse_metrics(text, 2, 1, True)
+        with self.assertRaises(RuntimeError): metrics.parse_metrics(text.replace('} 0', '} NaN'), 2, 2, True)
 
     def test_capacity_overrides_and_local_model_are_frozen(self):
         args = argparse.Namespace(experiment='qwen35-35b-matrix', runtime='native', run_id='test',
@@ -263,7 +250,7 @@ class GroupSelection(unittest.TestCase):
         args = argparse.Namespace(seed=0, groups=['l1'], output_length=1,
                                   warmup_rounds=1, repeats=2, max_attempts=2)
         calls = []
-        def sample(client, case, group, output_length, stage='measure'):
+        def sample(client, case, group, output_length, stage='measure', *, baseline=None):
             calls.append((group, stage))
             return dict(group=group, valid=True, output_ids='[7]', client_latency_ms=1, invalid_reason='')
         buffer = io.StringIO()

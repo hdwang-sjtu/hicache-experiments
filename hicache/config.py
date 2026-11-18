@@ -80,11 +80,10 @@ def read_profile(name, directory):
     return path, raw, data
 
 
-def resolve(name, runtime, argv, environ=None, directory=CONFIG_DIR, resolve_model=True, data=None):
+def resolve(profile, runtime, argv, environ=None, *, resolve_model=True):
     """优先级：CLI > 显式环境变量 > 文件；模型 CLI 覆盖需先处理挂载路径。"""
     environ = os.environ if environ is None else environ
-    path, raw, original = read_profile(name, directory)
-    data = original if data is None else data
+    path, raw, data = profile
     settings = data["server"]
     server = dict(settings["sglang"])
     for variable, (option, convert) in ENV_OPTIONS.items():
@@ -140,8 +139,8 @@ def resolve(name, runtime, argv, environ=None, directory=CONFIG_DIR, resolve_mod
     # CLI 只接受 SGLang 原生语法，store_true 标志不存在 '--flag false' 写法。
     enabled = enabled or "--enable-hierarchical-cache" in cli
     timer = boolean(environment.get("SGLANG_ENABLE_METRICS_DEVICE_TIMER", "0"), "SGLANG_ENABLE_METRICS_DEVICE_TIMER")
-    if timer and not enabled:
-        raise ValueError("GPU 计时需要开启 HiCache；关闭 HiCache 时也请设置 FORWARD_TIMING=0")
+    if timer and not (enabled or server.get("enable-hicache-experiment")):
+        raise ValueError("GPU 计时需要开启缓存实验接口，以确认所有 rank 空闲")
     if enabled:
         environment.setdefault("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", "python")
     configure_modes(settings, server, environment)
@@ -152,7 +151,7 @@ def resolve(name, runtime, argv, environ=None, directory=CONFIG_DIR, resolve_mod
         raise ValueError("路径、参数和环境变量不能包含 NUL 字符")
     yaml = yaml_module()
     return dict(
-        name=name, source_path=str(path.resolve()), source_sha256=hashlib.sha256(raw).hexdigest(),
+        name=path.stem, source_path=str(path.resolve()), source_sha256=hashlib.sha256(raw).hexdigest(),
         source_text=raw.decode("utf-8"), runtime=runtime, model_directory=model_dir,
         environment=environment, server=server, cli_args=cli,
         server_yaml=yaml.safe_dump(server, allow_unicode=True, sort_keys=False),
@@ -324,7 +323,8 @@ def main():
         print("\n".join(path.stem for path in sorted(CONFIG_DIR.glob("*.yaml"))))
     elif args.action == "resolve":
         argv = args.args[1:] if args.args[:1] == ["--"] else args.args
-        print(json.dumps(resolve(args.name, args.runtime, argv), ensure_ascii=False))
+        profile = read_profile(args.name, CONFIG_DIR)
+        print(json.dumps(resolve(profile, args.runtime, argv), ensure_ascii=False))
     elif args.action == "unpack":
         unpack(json.load(sys.stdin))
     elif args.action == "model-mount":

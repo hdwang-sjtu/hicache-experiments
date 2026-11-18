@@ -1,0 +1,52 @@
+# 双 H200 的 cold/L1 目标配置；GPU 验收状态见 docs/deepseek-v4.md。
+# dummy 仅下载配置/tokenizer；显式声明 FP4，不能靠不存在的权重 header 推断。
+model:
+  repo: deepseek-ai/DeepSeek-V4-Flash
+  revision: 60d8d70770c6776ff598c94bb586a859a38244f1
+server:
+  load-format: dummy
+  routing: round-robin
+  prefill-graph: breakable
+  env:
+    SGLANG_ENABLE_METRICS_DEVICE_TIMER: '1'
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND: python
+    SGLANG_DSV4_FP4_EXPERTS: '1'
+    SGLANG_DSV4_FP4_DEQUANT: '0'
+  sglang:
+    dtype: bfloat16
+    kv-cache-dtype: fp8_e4m3
+    attention-backend: dsv4
+    moe-runner-backend: flashinfer_mxfp4
+    flashinfer-mxfp4-moe-precision: bf16
+    tp-size: 2
+    ep-size: 1
+    pp-size: 1
+    dp-size: 1
+    host: 127.0.0.1
+    port: 39081
+    mem-fraction-static: 0.8
+    context-length: 32768
+    max-total-tokens: 32768
+    chunked-prefill-size: 32768
+    page-size: 256
+    max-running-requests: 1
+    cuda-graph-backend-decode: disabled
+    enable-metrics: true
+    enable-metrics-for-all-schedulers: true
+    return-output-ids: true
+    enable-hierarchical-cache: false
+    enable-hicache-experiment: true
+    # 显式限制 max-total-tokens 时，0.1 的 SWA 配额可能连一个 chunk 都放不下。
+    # 首版用保守的等额页预算，保留可供 radix 前缀恢复的分页 SWA/状态布局。
+    swa-full-tokens-ratio: 1.0
+    skip-server-warmup: true
+    random-seed: 0
+test:
+  prefix-lengths: [2k, 4k]
+  suffix-lengths: [128, 1024]
+  groups: [cold, l1]
+  output-length: 1
+  warmup-rounds: 2
+  repeats: 3
+  gpu-timing: true
+  ready-timeout: 1800

@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/arg_groups/fields/memory.py b/python/sglang/srt/arg_groups/fields/memory.py
-index c79a33346a8539639ada6c407d7a371aea7d4a2e..ce0280430bae261b48f43c8555b15448103d496f 100644
+index c79a33346a8539639ada6c407d7a371aea7d4a2e..afeeb0f8117fdc568bd3a8c4d7d5928e1a9dcf83 100644
 --- a/python/sglang/srt/arg_groups/fields/memory.py
 +++ b/python/sglang/srt/arg_groups/fields/memory.py
 @@ -96,6 +96,10 @@ class Memory(msgspec.Struct):
@@ -8,7 +8,7 @@ index c79a33346a8539639ada6c407d7a371aea7d4a2e..ce0280430bae261b48f43c8555b15448
      enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
 +    enable_hicache_experiment: A[
 +        bool,
-+        "Enable local-only HiCache inspection/demotion experiments (FULL or FULL+MAMBA, TP/PP/DP=1).",
++        "Enable local-only cache inspection (GPU FULL/FULL+SWA, or HiCache FULL/FULL+MAMBA); HiCache demotion requires CPU backups.",
 +    ] = False
      hicache_host_memory_mode: A[
          str,
@@ -61,6 +61,140 @@ index 7165a5ca8c3cceea29b66862bf27f3a2a97c9fae..292b38f5b08567c28eeceb752be9cbb6
  @app.post("/add_external_corpus")
  @auth_level(AuthLevel.ADMIN_OPTIONAL)
  async def add_external_corpus(request: Request):
+diff --git a/python/sglang/srt/layers/moe/hash_topk.py b/python/sglang/srt/layers/moe/hash_topk.py
+index d32c600ff200cfb880b64bf5ce9505775e24a8b4..e952271988e1f89c959a42ce681bdcf541c96b56 100644
+--- a/python/sglang/srt/layers/moe/hash_topk.py
++++ b/python/sglang/srt/layers/moe/hash_topk.py
+@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.topk import (
+     StandardTopKOutput,
+     TopKConfig,
+     _mask_topk_ids_padded_region,
++    _simulate_routed_experts,
+     _zero_topk_weights_padded_region,
+     remap_topk_for_per_rank_shared_slots,
+ )
+@@ -247,6 +248,17 @@ class HashTopK(nn.Module):
+         if _is_hip or _is_npu:
+             topk_weights = topk_weights.to(torch.float32)
+ 
++        uniform = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
++        round_robin = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
++        if uniform and round_robin:
++            raise ValueError("uniform and round-robin expert simulation are mutually exclusive")
++        if uniform or round_robin:
++            _simulate_routed_experts(
++                topk_ids, topk_weights, self.num_experts,
++                num_routed_topk=self.topk-self.num_fused_shared_experts,
++                layer_id=self.layer_id, random=uniform,
++            )
++
+         if self.apply_routed_scaling_factor_on_output:
+             topk_weights = topk_weights * self.routed_scaling_factor
+ 
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 6d8db4e2c3f3f916144ccaaa0c4bed8151a77800..a439a22ea018fa14a5510b83f318403148c75576 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -500,6 +500,7 @@ def _simulate_balanced_routing(
+     token_shard_rank: int = 0,
+     num_token_shards: int = 1,
+     seed: Optional[int] = None,
++    weight_scale: float = 1.0,
+ ) -> None:
+     """Benchmark-only fused override (in place): replace ``topk_ids`` with a
+     balanced expert assignment and ``topk_weights`` with ``1/k`` using a single
+@@ -560,7 +561,7 @@ def _simulate_balanced_routing(
+         num_ranks,
+         experts_per_rank,
+         deal_offset,
+-        1.0 / k,
++        weight_scale / k,
+         seed,
+         token_shard_rank,
+         num_token_shards,
+@@ -574,6 +575,33 @@ def _simulate_balanced_routing(
+     )
+ 
+ 
++def _simulate_routed_experts(
++    topk_ids, topk_weights, num_experts, *, num_routed_topk, layer_id, random,
++    weight_scale=1.0,
++):
++    """One benchmark override shared by ordinary and hash TopK.
++
++    Keep fused shared columns intact and use identical shard offsets on both
++    paths. Call before logical-to-physical remapping and padded-row masking.
++    """
++    parallel = get_parallel()
++    if is_moe_input_scattered_across_dp_ranks():
++        token_shard_rank = parallel.attn_dp_rank
++        num_token_shards = parallel.attn_dp_size
++        forward = get_forward()
++        if forward.attn_tp_sequence_sharded or forward.attn_input_scattered:
++            token_shard_rank = token_shard_rank * parallel.attn_tp_size + parallel.attn_tp_rank
++            num_token_shards *= parallel.attn_tp_size
++    else:
++        token_shard_rank, num_token_shards = 0, 1
++    _simulate_balanced_routing(
++        topk_ids[:, :num_routed_topk], topk_weights[:, :num_routed_topk], num_experts,
++        random=random, num_ranks=parallel.moe_ep_size, layer_id=layer_id,
++        token_shard_rank=token_shard_rank, num_token_shards=num_token_shards,
++        weight_scale=weight_scale,
++    )
++
++
+ # -------------------------------- TopK ---------------------------------------
+ 
+ 
+@@ -2827,44 +2855,11 @@ def select_experts(
+         )
+ 
+     if routing_overridden:
+-        # Benchmark-only: override gating with a balanced expert assignment (so
+-        # dummy/random benchmark tokens don't skew MoE load) via a single fused
+-        # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
+-        # replaces, to minimize timing perturbation. Do NOT use in production.
+-        parallel = get_parallel()
+-        if is_moe_input_scattered_across_dp_ranks():
+-            token_shard_rank = parallel.attn_dp_rank
+-            num_token_shards = parallel.attn_dp_size
+-            forward = get_forward()
+-            if forward.attn_tp_sequence_sharded or forward.attn_input_scattered:
+-                # This forward routes attention-TP-local rows (sequence-sharded
+-                # attention TP, or the layer-boundary attention input scatter):
+-                # each attention-TP rank holds its own slice of the DP shard, so
+-                # it is a shard of its own rather than a replica of its peers.
+-                token_shard_rank = (
+-                    token_shard_rank * parallel.attn_tp_size + parallel.attn_tp_rank
+-                )
+-                num_token_shards *= parallel.attn_tp_size
+-        else:
+-            # Gathered MoE presents one global token buffer to every rank, so
+-            # its routing must remain identical across those replicas.
+-            token_shard_rank, num_token_shards = 0, 1
+-
+-        override_topk_ids, override_topk_weights = topk_ids, topk_weights
+-        if num_routed_topk < top_k:
+-            # Only the routed columns are simulated; a fused shared-expert
+-            # column keeps the id and weight the router gave it.
+-            override_topk_ids = topk_ids[:, :num_routed_topk]
+-            override_topk_weights = topk_weights[:, :num_routed_topk]
+-        _simulate_balanced_routing(
+-            override_topk_ids,
+-            override_topk_weights,
+-            router_logits.shape[1],
++        _simulate_routed_experts(
++            topk_ids, topk_weights, router_logits.shape[1],
++            num_routed_topk=num_routed_topk, layer_id=layer_id,
+             random=simulate_uniform_experts,
+-            num_ranks=parallel.moe_ep_size,
+-            layer_id=layer_id,
+-            token_shard_rank=token_shard_rank,
+-            num_token_shards=num_token_shards,
++            weight_scale=routed_scaling_factor if apply_routed_scaling_factor_on_output else 1.0,
+         )
+         # The override rewrote every row, including the router-masked ones.
+         padded_rows_masked = False
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
 index e32fc011409086dc7e5b03b6e80a19900fb4df41..2db7ef183a2bfc0f95e9437679f2782dd71e0088 100644
 --- a/python/sglang/srt/managers/io_struct.py
@@ -115,7 +249,7 @@ index e32fc011409086dc7e5b03b6e80a19900fb4df41..2db7ef183a2bfc0f95e9437679f2782d
      corpus_id: Optional[str] = None
      file_path: Optional[str] = None
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 79efa0bacc63b49c08540af6bcc644576e1b12a0..e0282482f88514e69dcca489945d631daebca295 100644
+index 79efa0bacc63b49c08540af6bcc644576e1b12a0..8a943f90d11490f8d51476536b36e4341349fa29 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -150,6 +150,8 @@ from sglang.srt.managers.io_struct import (
@@ -193,7 +327,7 @@ index 79efa0bacc63b49c08540af6bcc644576e1b12a0..e0282482f88514e69dcca489945d631d
              if radix_native_session:
                  req.session_generation = self.tree_cache.ensure_session_generation(
                      recv_req.session_id
-@@ -5345,6 +5392,36 @@ class Scheduler(
+@@ -5345,6 +5392,35 @@ class Scheduler(
  
          return DetachHiCacheStorageReqOutput(success=False, message=msg)
  
@@ -207,13 +341,12 @@ index 79efa0bacc63b49c08540af6bcc644576e1b12a0..e0282482f88514e69dcca489945d631d
 +                or parallel.ep_size not in (1, parallel.tp_size)
 +                or parallel.pp_size != 1 or parallel.dp_size != 1
 +                or parallel.moe_dp_size != 1 or parallel.enable_dp_attention
-+                or not self.enable_hierarchical_cache
 +                or not isinstance(self.tree_cache, UnifiedRadixCache)
 +                or not self.spec_algorithm.is_none()
 +                or self.disaggregation_mode != DisaggregationMode.NULL
 +                or get_memory().enable_session_radix_cache):
 +            return HiCacheExperimentReqOutput(
-+                success=False, message="需要 TP=1/2/4、EP=1/TP、PP=DP=1，无推测/会话的 HiCache")
++                success=False, message="需要 TP=1/2/4、EP=1/TP、PP=DP=1，无推测/会话的 UnifiedRadixCache")
 +
 +        def gather(value):
 +            if parallel.tp_size == 1:
@@ -289,20 +422,76 @@ index 3dd350f411ed36b6339794e1489909ab81f07297..16ad19bcd9c3c7ae27c0acd73980692c
                  token_type_ids=token_type_ids,
                  need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
 diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
-index d1399f088dc0c8236497fb8c956a3b5a89e9865d..343bdde7cefbe1913eb29f2517424f3a18ffc628 100644
+index d1399f088dc0c8236497fb8c956a3b5a89e9865d..6038d5104cb74023d24b59e5994465b754176348 100644
 --- a/python/sglang/srt/mem_cache/unified_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
-@@ -856,6 +856,177 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -856,6 +856,233 @@ class UnifiedRadixCache(BasePrefixCache):
          self._free_values(result.device_frees, result.host_frees)
          self._accumulate_tracker(tracker, result.tracker)
  
++    def _experiment_device_state(self, prefix_ids: list[int], *, action: str) -> dict:
++        """Inspect GPU-only prefixes through the real multi-component matcher.
++
++        No host controller is involved. The V4 C4 KV/indexer share FULL page
++        ownership; C4 compressor state shares SWA pages and C128 pending state
++        belongs to request slots. Count each independent allocator exactly once.
++        This deliberately rejects replay/ring and session layouts not accepted
++        by this experiment; FULL's match length alone does not prove an SWA hit.
++        """
++        if action != "inspect":
++            raise ValueError("GPU-only cache supports inspect, not demote/L2")
++        if (self.disable or not isinstance(self.tree_core, UnifiedTreeCore)
++                or set(self.tree_components) not in (
++                    {ComponentType.FULL}, {ComponentType.FULL, ComponentType.SWA})
++                or self.sidecar_pool_specs or self.session.slots
++                or self.linker is not None or self.enable_storage):
++            raise ValueError("GPU inspection requires a plain Python FULL/FULL+SWA tree")
++        if not prefix_ids:
++            raise ValueError("prefix_ids must be nonempty")
++        allocator = self.token_to_kv_pool_allocator
++        kv = allocator.get_kvcache()
++        if getattr(allocator, "swa_req_ring", False) or getattr(kv, "_unified_kv", False):
++            raise ValueError("GPU experiment requires paged SWA, not replay/request-ring KV")
++        # A read-only match rounds its key down to complete pages. Allow P+S
++        # to end in a partial page so reuse checks can still examine the full input.
++        match = self.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix_ids))))
++        pools = {}
++        for name, pool in (
++            ("full", getattr(allocator, "full_attn_allocator", allocator)),
++            ("swa", getattr(allocator, "swa_attn_allocator", None)),
++            ("c128", getattr(allocator, "c128_attn_allocator", None)),
++        ):
++            if pool is not None:
++                pools[name] = dict(capacity=int(pool.size), free=int(pool.available_size()))
++        pools["request"] = dict(free=int(self.req_to_token_pool.available_size()))
++        full = pools["full"]
++        components = [ct.name.lower() for ct in self.tree_components]
++        ownership = {}
++        if hasattr(kv, "compression_ratios"):
++            if set(kv.compression_ratios) - {0, 4, 128}:
++                raise ValueError("V4 experiment accepts only the original C4/C128 checkpoint")
++            components += ["c4", "c128", "indexer", "compress_state"]
++            ownership = dict(c4="full", c128="full", indexer="full", c4_state="swa", c128_state="request")
++        return dict(
++            cache_mode="device", cache_components=components, pool_ownership=ownership,
++            device_pools=pools, skip_radix_cache_insert=True,
++            prefix_tokens=len(prefix_ids), matched_tokens=match.device_prefix_len,
++            device_tokens=match.device_prefix_len, host_hit_tokens=0,
++            host_backed_tokens=0, backup_complete=False,
++            device_free_tokens=full["free"], device_used_tokens=full["capacity"]-full["free"],
++            host_free_tokens=0, host_used_tokens=0,
++        )
++
 +    def experiment_control(self, prefix_ids: list[int], *, action: str) -> dict:
 +        """Scheduler 空闲后调用：检查目标 P，或保留 CPU 副本定向逐出 GPU。
 +
-+        只允许单条 FULL 或 FULL+MAMBA 分支；混合模型必须在 P 处有完整状态。
++        GPU-only 只检查 FULL/FULL+SWA；HiCache 只允许单条 FULL 或 FULL+MAMBA
++        分支，混合模型必须在 P 处有完整状态。
 +        除了复用正常 match 的边界拆分，所有检查都先于释放；绝不直接释放 Tensor。
 +        """
 +        cc = self.cache_controller
++        if cc is None and not get_memory().enable_hierarchical_cache:
++            return self._experiment_device_state(prefix_ids, action=action)
 +        if (
 +            self.disable
 +            or not isinstance(self.tree_core, UnifiedTreeCore)
@@ -470,6 +659,59 @@ index d1399f088dc0c8236497fb8c956a3b5a89e9865d..343bdde7cefbe1913eb29f2517424f3a
      def _drop_subtree_no_host(
          self, node_id: NodeId, tracker: dict[ComponentType, int]
      ) -> bool:
+diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
+index 9fc65d822b10cadd3da88563ad8e0ca4028a1634..b64ee025dacd2dcc8cb0a192ac7b2b24f68d0eb5 100644
+--- a/python/sglang/srt/model_loader/weight_utils.py
++++ b/python/sglang/srt/model_loader/weight_utils.py
+@@ -1750,6 +1750,19 @@ def initialize_capture_safe_weights(
+             param.fill_(value)
+ 
+ 
++def initialize_dummy_mxfp4(weight, scale, seed: int) -> None:
++    """Fill packed E2M1 bytes directly; scale is a native UE8M0 tensor.
++
++    The signed int8 used by V4 and uint8 describe the same packed bytes. Every
++    nibble is finite; exponent 115 gives a small nonzero 2**-12 block scale.
++    No temporary full-size float weights are allocated on the device.
++    """
++    generator = torch.Generator(device=weight.device)
++    generator.manual_seed(seed)
++    weight.view(torch.uint8).random_(0, 256, generator=generator)
++    scale.view(torch.uint8).fill_(115)
++
++
+ def initialize_dummy_weights(
+     model: torch.nn.Module,
+     low: float = -1e-3,
+@@ -1768,10 +1781,26 @@ def initialize_dummy_weights(
+     is fixed, the random values generated by this function only depends on
+     the parameter's number of elements and its data type.
+     """
+-    for name, param in model.state_dict().items():
++    state = model.state_dict()
++    for name, param in state.items():
++        # MXFP4 routed experts are packed integer bytes, not floating tensors.
++        # Initialize them before backend swizzling; every E2M1 nibble is finite.
++        # The E8M0 sibling scale distinguishes these from unrelated int weights.
++        scale = state.get(name + "_scale_inv")
++        if (param.dtype in (torch.int8, torch.uint8) and scale is not None
++                and scale.dtype == torch.float8_e8m0fnu):
++            initialize_dummy_mxfp4(param, scale, seed)
++            continue
+         if torch.is_floating_point(param):
+             if name.endswith("weight_scale_inv"):
+-                param.fill_(1.0)
++                weight = state.get(name.removesuffix("_scale_inv"))
++                if (param.dtype == torch.float8_e8m0fnu and weight is not None
++                        and weight.dtype in (torch.int8, torch.uint8)):
++                    # UE8M0 byte 115 = 2**-12: E2M1 magnitudes stay near the
++                    # existing +/-1e-3 dummy range, without a BF16 weight copy.
++                    param.view(torch.uint8).fill_(115)
++                else:
++                    param.fill_(1.0)
+                 continue
+             generator = torch.Generator(device=param.data.device)
+             generator.manual_seed(seed)
 diff --git a/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py b/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py
 index 203dbe3ac9df5db5dd3aa518623bda95ab852be2..c19559b9517c8bc07148b3edc863920557b1678f 100644
 --- a/test/registered/unit/mem_cache/test_unified_radix_cache_unittest.py

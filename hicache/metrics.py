@@ -35,30 +35,34 @@ def rank_states(state, tp):
 def check_state(state, group, p, tp):
     """检查每张卡的完整 P 检查点；GPU KV 命中不能代替线性状态检查。"""
     for rank, value in rank_states(state, tp).items():
+        # device-only 检查没有 CPU 备份；逻辑命中仍必须经过所有组件的正常匹配。
+        device_only = value.get('cache_mode') == 'device'
+        if device_only and group == 'l2':
+            raise RuntimeError('仅 GPU 缓存不支持 L2')
         wanted = dict(device_tokens=p if group == 'l1' else 0,
                       host_hit_tokens=p if group == 'l2' else 0,
-                      host_backed_tokens=p if group != 'cold' else 0)
+                      host_backed_tokens=p if group != 'cold' and not device_only else 0)
         if 'mamba' in value.get('cache_components', []):
             wanted.update(mamba_device_states=int(group == 'l1'),
                           mamba_host_states=int(group != 'cold'))
-        if group != 'cold':
+        if group != 'cold' and not device_only:
             wanted['backup_complete'] = True
         for key, expected in wanted.items():
             if value.get(key) != expected:
                 raise RuntimeError(f'rank={rank} {group} {key}: {value.get(key)} != {expected}')
 
 
-def parse_metrics(text, tp, ep, hybrid, *, gpu_timing=True):
-    """一套解析规则覆盖单卡/多卡；未启用计时时只要求 H2D 指标。
+def parse_metrics(text, tp, ep, hybrid, *, gpu_timing=True, hierarchical=True):
+    """一套解析规则覆盖单卡/多卡；GPU-only 不要求 H2D 指标。
 
     Prometheus 全文只在内存中筛选。缺失值不能填零，重复 label 不能累加，
     否则可能把其他模型或 rank 的活动误算作本次请求。
     """
     result = {rank: {} for rank in range(tp)}
-    required = set(LOAD.values()) | {'kv_tokens'}
+    required = (set(LOAD.values()) | {'kv_tokens'}) if hierarchical else set()
     if gpu_timing:
         required.update(FORWARD.values())
-    if hybrid:
+    if hybrid and hierarchical:
         required.add('mamba_states')
     for line in text.splitlines():
         match = re.fullmatch(r'([\w:]+)\{(.*)\}\s+(\S+)(?:\s+\S+)?', line)
@@ -113,14 +117,16 @@ def graph_error(deltas, mode):
     return ''
 
 
-def metric_delta(before, after, *, p, s, group, chunk, state, gpu_timing=True):
+def metric_delta(before, after, *, p, s, group, chunk, state, gpu_timing=True, hierarchical=True):
     """只接受与本次输入、缓存层级和实际池大小一致的累计差值。
 
     服务必须独占且单请求；计数差值本身没有 request ID。Cold 计算 P+S，
     命中后计算 S；各 rank 的逻辑 token 应相同，物理传输量分别检查。
     """
     compute = p + s if group == 'cold' else s
-    expected = dict(kv_tokens=p if group == 'l2' else 0)
+    if not hierarchical and group == 'l2':
+        raise RuntimeError('仅 GPU 缓存不支持 L2')
+    expected = dict(kv_tokens=p if group == 'l2' else 0) if hierarchical else {}
     if gpu_timing:
         expected.update(passes=math.ceil(compute / chunk), compute=compute, input=compute,
                         device=p if group == 'l1' else 0, host=p if group == 'l2' else 0, storage=0)
@@ -166,6 +172,8 @@ class RankMetrics:
         self.tp, self.ep = info['tp_size'], info.get('ep_size', 1)
         self.hybrid = hybrid
         self.gpu_timing = gpu_timing
+        # 旧调用方没有此字段时沿用 HiCache；真实 Driver 提供实际 server_info。
+        self.hierarchical = info.get('enable_hierarchical_cache', True)
         self.chunk = info.get('chunked_prefill_size')
 
     def snapshot(self, stage, before=None, **expected):
@@ -177,9 +185,11 @@ class RankMetrics:
         while True:
             try:
                 raw, _ = self.client.request('/metrics', stage=stage, parse_json=False)
-                snapshot = parse_metrics(raw, self.tp, self.ep, self.hybrid, gpu_timing=self.gpu_timing)
+                snapshot = parse_metrics(raw, self.tp, self.ep, self.hybrid,
+                                         gpu_timing=self.gpu_timing, hierarchical=self.hierarchical)
                 if before is not None:
-                    metric_delta(before, snapshot, chunk=self.chunk, gpu_timing=self.gpu_timing, **expected)
+                    metric_delta(before, snapshot, chunk=self.chunk, gpu_timing=self.gpu_timing,
+                                 hierarchical=self.hierarchical, **expected)
                 now = time.monotonic()
                 if previous != snapshot:
                     previous, since = snapshot, now
@@ -193,7 +203,8 @@ class RankMetrics:
 
     def finish(self, before, stage, rid, **expected):
         after = self.snapshot(stage + ':metrics_after', before, **expected)
-        expectation = dict(expected, chunk=self.chunk, gpu_timing=self.gpu_timing)
+        expectation = dict(expected, chunk=self.chunk, gpu_timing=self.gpu_timing,
+                           hierarchical=self.hierarchical)
         delta = metric_delta(before, after, **expectation)
         self.last_deltas = delta
         record = dict(stage=stage, request_id=rid, tp=self.tp, ep=self.ep,
@@ -201,10 +212,13 @@ class RankMetrics:
         with self.path.open('a') as file:
             file.write(json.dumps(record) + '\n')
         # 时间取最慢 rank；逻辑 token 不按卡累加，物理字节数才求和。
-        result = dict(kv_load_ms=max(d['load_seconds'] for d in delta.values()) * 1000,
-                    kv_load_tokens=delta[0]['kv_tokens'], kv_load_bytes=sum(d['load_bytes'] for d in delta.values()),
-                    kv_load_ops=max(d['load_ops'] for d in delta.values()),
-                    mamba_load_states=delta[0].get('mamba_states', 0))
+        result = {}
+        if self.hierarchical:
+            result.update(kv_load_ms=max(d['load_seconds'] for d in delta.values()) * 1000,
+                          kv_load_tokens=delta[0]['kv_tokens'],
+                          kv_load_bytes=sum(d['load_bytes'] for d in delta.values()),
+                          kv_load_ops=max(d['load_ops'] for d in delta.values()),
+                          mamba_load_states=delta[0].get('mamba_states', 0))
         if self.gpu_timing:
             result.update(prefill_forward_gpu_ms=max(d['seconds'] for d in delta.values()) * 1000,
                           prefill_forward_passes=delta[0]['passes'],

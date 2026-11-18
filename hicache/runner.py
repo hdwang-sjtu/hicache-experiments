@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
+from http.client import RemoteDisconnected
 import json
 import math
 import os
@@ -24,7 +25,7 @@ import uuid
 
 from hicache.prepare import cache_lock, docker_model_mount, write_json
 from hicache.metrics import metric_delta, graph_error
-from hicache.metadata import code_files, snapshot_code
+from hicache.metadata import snapshot_code
 from hicache import config as serve_config
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -33,22 +34,12 @@ TEST_OPTIONS = {
     "prefix-lengths", "suffix-lengths", "groups", "output-length", "repeats", "max-attempts",
     "warmup-rounds", "seed", "timeout", "ready-timeout", "no-plot", "gpu-timing", "note", "text-file", "prefix-reuse",
 }
-CODE_FILES = code_files()
 
 
 def named(name):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
         raise ValueError("名称只能包含字母、数字、点、下划线和连字符")
     return name
-
-
-def load_experiment(name, project=PROJECT):
-    path, _, data = serve_config.read_profile(name, project / "configs/experiments")
-    if not isinstance(data["test"], dict) or set(data["test"]) - TEST_OPTIONS:
-        raise ValueError(f"test 仅支持这些 Driver 参数：{sorted(TEST_OPTIONS)}")
-    if not {"prefix-lengths", "suffix-lengths", "groups", "repeats"} <= data["test"].keys():
-        raise ValueError("实验需显式指定 prefix-lengths、suffix-lengths、groups、repeats")
-    return path, data
 
 
 def test_arguments(settings):
@@ -205,12 +196,18 @@ class Job:
         self.project = Path(project)
         self.args = args
         self.env = dict(os.environ if environ is None else environ)
-        self.experiment_path, self.experiment = load_experiment(args.experiment, self.project)
+        profile = serve_config.read_profile(args.experiment, self.project / "configs/experiments")
+        self.experiment_path, _, self.experiment = profile
+        settings = self.experiment["test"]
+        if settings.keys() - TEST_OPTIONS:
+            raise ValueError(f"test 仅支持这些 Driver 参数：{sorted(TEST_OPTIONS)}")
+        if not {"prefix-lengths", "suffix-lengths", "groups", "repeats"} <= settings.keys():
+            raise ValueError("实验需显式指定 prefix-lengths、suffix-lengths、groups、repeats")
         for key in ("prefix_lengths", "suffix_lengths", "groups", "repeats", "no_plot", "prefix_reuse"):
             value = getattr(args, key, None)
             if value is not None:
-                self.experiment["test"][key.replace("_", "-")] = value
-        self.test_argv, self.test = test_arguments(self.experiment["test"])
+                settings[key.replace("_", "-")] = value
+        self.test_argv, self.test = test_arguments(settings)
         self.lock = json.loads((self.project / "configs/runtime.lock.json").read_text())
         if getattr(args, "image", None):
             self.lock["image"] = args.image
@@ -230,12 +227,17 @@ class Job:
         for option in ("load_format", "routing", "prefill_graph"):
             if getattr(args, option, None) is not None:
                 self.experiment["server"][option.replace("_", "-")] = getattr(args, option)
-        self.resolution = serve_config.resolve(args.experiment, args.runtime, [], self.env,
-                                               self.project / "configs/experiments", resolve_model=False,
-                                               data=self.experiment)
+        self.resolution = serve_config.resolve(profile, args.runtime, [], self.env, resolve_model=False)
         server = self.resolution["server"]
+        if self.experiment['model']['repo'] == 'deepseek-ai/DeepSeek-V4-Flash':
+            if server.get('enable-hierarchical-cache') or 'l2' in self.test.groups:
+                raise ValueError('DeepSeek V4 第一版仅支持无 HiCache 的 cold/L1')
+            if server.get('ep-size', 1) != 1 or server.get('page-size') != 256:
+                raise ValueError('DeepSeek V4 FP4 实验需要 EP=1、page-size=256')
         hybrid = "mamba-radix-cache-strategy" in server
-        if hybrid:
+        device_experiment = (not server.get('enable-hierarchical-cache')
+                             and server.get('enable-hicache-experiment'))
+        if hybrid or device_experiment:
             required = max(self.test.prefix_lengths) + max(self.test.suffix_lengths) + self.test.output_length
             defaults = {"context-length": max(16384, ((required + 2047) // 2048) * 2048)}
             defaults["max-total-tokens"] = max(32768, defaults["context-length"])
@@ -246,22 +248,25 @@ class Job:
             if "CHUNKED_PREFILL_SIZE" not in self.env:
                 server["chunked-prefill-size"] = min(server["context-length"], 32768)
             if (self.test.output_length != 1 or not self.test.gpu_timing
-                    or not server.get("enable-hierarchical-cache")):
-                raise ValueError("混合缓存实验要求 HiCache、GPU timing 和单 token 输出")
+                    or (hybrid and not server.get("enable-hierarchical-cache"))):
+                raise ValueError("缓存实验要求 GPU timing 和单 token 输出；Qwen3.5 仍需 HiCache")
+            if device_experiment and 'l2' in self.test.groups:
+                raise ValueError('仅 GPU 缓存实验不支持 L2')
             if min(server["context-length"], server["max-total-tokens"]) < required:
                 raise ValueError("实际配置容量必须至少为 P+S+1")
             chunk = server["chunked-prefill-size"]
-            if chunk <= 0 or chunk > server["context-length"] or chunk % 256:
-                raise ValueError("chunk 必须为 256 的正整数倍且不超过 context")
+            grid = 256 if hybrid else server.get('page-size', 1)
+            if grid < 1 or chunk <= 0 or chunk > server["context-length"] or chunk % grid:
+                raise ValueError(f"chunk 必须为 {grid} 的正整数倍且不超过 context")
             if max(self.test.suffix_lengths) > chunk:
                 raise ValueError("S 超过 chunk；L1/L2 后缀要求一次 Forward")
-            if any(p % 256 for p in self.test.prefix_lengths):
-                raise ValueError("Qwen3.5 前缀需按 256 对齐")
+            if any(p % grid for p in self.test.prefix_lengths):
+                raise ValueError(f"前缀需按 {grid} 对齐")
             server["max-prefill-tokens"] = server["context-length"]
         tp, ep = server.get("tp-size", 1), server.get("ep-size", 1)
         if tp not in (1, 2, 4) or ep not in (1, tp):
             raise ValueError("支持 TP=1/2/4、EP=1 或 EP=TP")
-        serve_config.configure_graph(server, self.experiment["test"])
+        serve_config.configure_graph(server, settings)
         self.test_argv += ["--prefill-graph", server["cuda-graph-backend-prefill"]]
         self.host, self.port = server.get("host", "127.0.0.1"), int(server.get("port", 39081))
         if self.host not in ("127.0.0.1", "localhost", "0.0.0.0", "::", "::1") or not 0 < self.port < 65536:
@@ -289,7 +294,6 @@ class Job:
         # 用绝对 Python 路径执行总控时，宿主机包装脚本也使用该解释器所在环境。
         self.env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + self.env.get("PATH", os.defpath)
         self.env["NO_PROXY"] = self.env.get("NO_PROXY", "") + ",127.0.0.1,localhost,::1"
-        self.processes = []
         self.active_processes = []
         self.threads = []
         self.server = None
@@ -308,9 +312,10 @@ class Job:
         """执行冻结副本，保证长实验期间编辑工作区不会混入本轮结果。"""
         self.code.mkdir()
         self.state["code_sha256"] = snapshot_code(self.code, self.project)
-        (self.root / "serve-original.yaml").write_text(self.resolution["source_text"])
+        # 两个归档名沿用既有结果格式，内容取自生成本轮配置时读取的原文。
+        for name in ("serve-original.yaml", "experiment.yaml"):
+            (self.root / name).write_bytes(self.resolution["source_text"].encode("utf-8"))
         write_json(self.root / "resolved-experiment.json", self.experiment)
-        (self.root / "experiment.yaml").write_bytes(self.experiment_path.read_bytes())
         write_json(self.root / "runtime.lock.json", self.lock)
         shutil.copyfile(self.project / self.lock["patch"], self.root / "sglang.patch")
         if "text-file" in self.experiment["test"]:
@@ -326,7 +331,6 @@ class Job:
     def start(self, command, log_name):
         process = subprocess.Popen(command, cwd=self.code, env=self.env, start_new_session=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-        self.processes.append(process)
         self.active_processes.append(process)
         self.state.setdefault("processes", []).append(dict(pid=process.pid, command=command, log=log_name))
         write_json(self.root / "run.json", self.state)
@@ -411,7 +415,7 @@ class Job:
                         raise RuntimeError("就绪端口上的服务不属于本任务，拒绝发送测试请求")
                     write_json(self.root / "server-ready.json", info)
                     return
-            except (urllib.error.URLError, TimeoutError):
+            except (urllib.error.URLError, TimeoutError, RemoteDisconnected):
                 pass
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"服务在 {self.test.ready_timeout} 秒内未就绪")

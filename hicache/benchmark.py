@@ -4,7 +4,7 @@
 服务可由 Docker、serve.sh 或其他方式启动；本脚本不管理服务生命周期。
 模型权重和 SGLang 只需装在服务端，客户端仅需匹配的 tokenizer 文件。
 
-阅读顺序：main → run → run_samples → execute_sample → validate。
+阅读顺序：run → run_samples → collect_case → execute_sample → validate。
   run        运行实验：准备输入 → 等待服务 → 采样 → 保存 CSV 和汇总。
   analyze    读取已有结果重新汇总，不访问模型或服务器。
 
@@ -16,6 +16,7 @@ L2 先确认 CPU 备份完成，再通过实验接口逐出 GPU。
 
 import argparse
 import csv
+from functools import partial
 import hashlib
 import importlib.metadata
 import json
@@ -53,7 +54,6 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
 
 
-
 def tile(tokens, length):
     """重复一段已分词的序列，再截取到精确长度；不重新拼接文本分词。"""
     if not tokens:
@@ -62,7 +62,7 @@ def tile(tokens, length):
 
 
 def make_cases(tokenizer, prefixes, suffixes, text):
-    """为每个 P/S 组合保存独立准备的 prefix、测量 suffix 和输入哈希。"""
+    """请求和可重建的输入归档共用一次分词，每种长度只展开一份 token。"""
     unit = tokenizer.encode(text, add_special_tokens=False)
     suffix = tokenizer.encode(
         "The next task is to review the recorded observations. ",
@@ -77,27 +77,14 @@ def make_cases(tokenizer, prefixes, suffixes, text):
     suffix_inputs = {s: tile(suffix, s) for s in suffixes}
     for p in prefixes:
         for s in suffixes:
-            measured = suffix_inputs[s]
-            prefix = prefix_inputs[p]
-            cases.append(
-                dict(
-                    id=f"p{p}_s{s}",
-                    prefix=prefix,
-                    suffix=measured,
-                    input_sha256=digest(prefix + measured),
-                )
-            )
-    return cases
-
-
-def input_manifest(tokenizer, cases, text):
-    """保存可精确重建的基序列，不把长 P 按 S 的数量重复写入磁盘。"""
-    return dict(schema_version=2, text=text,
-                prefix_unit=tokenizer.encode(text, add_special_tokens=False),
-                suffix_unit=tokenizer.encode("The next task is to review the recorded observations. ",
-                                             add_special_tokens=False),
-                cases=[dict(id=c['id'], prefix_length=len(c['prefix']), suffix_length=len(c['suffix']),
-                            input_sha256=c['input_sha256']) for c in cases])
+            prefix, tail = prefix_inputs[p], suffix_inputs[s]
+            cases.append(dict(id=f"p{p}_s{s}", prefix=prefix, suffix=tail,
+                              input_sha256=digest(prefix + tail)))
+    manifest = dict(schema_version=2, text=text, prefix_unit=unit, suffix_unit=suffix, cases=[
+        dict(id=c["id"], prefix_length=len(c["prefix"]), suffix_length=len(c["suffix"]),
+             input_sha256=c["input_sha256"]) for c in cases
+    ])
+    return cases, manifest
 
 
 class Client:
@@ -282,7 +269,7 @@ def prepare_prefix(client, case):
     return after
 
 
-def check_reused_prefix(client, case, after):
+def check_reused_prefix(client, case, baseline, after):
     """检查完整输入也只能命中 P，且请求私有 KV/GDN 槽位已全部归还。
 
     仅检查 P 的命中会漏掉树上的 S 子节点。池占用对比同一个 P 的初始
@@ -290,10 +277,10 @@ def check_reused_prefix(client, case, after):
     """
     tp, p = client.rank_metrics.tp, len(case['prefix'])
     check_state(after, 'l1', p, tp)
-    full = client.wait_cache(case['prefix'] + case['suffix'])
-    baseline = rank_states(client.prefix_state, tp)
+    matches = rank_states(client.wait_cache(case['prefix'] + case['suffix']), tp)
+    baseline = rank_states(baseline, tp)
     for rank, state in rank_states(after, tp).items():
-        match = rank_states(full, tp)[rank]
+        match = matches[rank]
         if match.get('matched_tokens') != p or match.get('device_tokens') != p:
             raise RuntimeError(f'rank={rank} P+S 缓存超出或不足 P')
         keys = ['device_used_tokens', 'host_used_tokens']
@@ -303,9 +290,15 @@ def check_reused_prefix(client, case, after):
             if key not in state or state[key] != baseline[rank].get(key):
                 raise RuntimeError(f'rank={rank} {key} 未回到 P 基线：'
                                    f'{state.get(key)} != {baseline[rank].get(key)}')
+        # V4 的 C4/indexer 跟随 FULL 页，压缩状态跟随 SWA 页或请求槽。
+        # 比较所有独立分配器，而不是把逻辑 P 当成实际物理缓存占用。
+        if state.get('cache_mode') == 'device':
+            pools = baseline[rank].get('device_pools')
+            if not pools or state.get('device_pools') != pools:
+                raise RuntimeError(f'rank={rank} 压缩/滑窗/请求槽未回到 P 基线')
 
 
-def execute_sample(client, case, group, output_length, stage="measure"):
+def execute_sample(client, case, group, output_length, stage="measure", *, baseline=None):
     """测量 P+S；复用时只恢复/降级 P，独立模式则逐次清空和准备。
 
     缓存控制和准备均在计时外。复用请求只读取共享 P，新增状态在结束时
@@ -316,16 +309,14 @@ def execute_sample(client, case, group, output_length, stage="measure"):
     if environment is not None:
         environment.wait_ready()
     rank_reader = getattr(client, "rank_metrics", None)
-    reuse = bool(getattr(client, 'prefix_reuse', False) and group != 'cold')
-    if not reuse:
-        if group == 'cold':
-            client.flush()
-        else:
-            prepare_prefix(client, case)
+    if group == "cold":
+        client.flush()
+    elif baseline is None:
+        prepare_prefix(client, case)
     before_state = None
     before_metrics = None
     if rank_reader:
-        # HiCache 的状态和指标统一逐 rank 检查，单卡就是只有 rank 0。
+        # 缓存的状态和指标统一逐 rank 检查，单卡就是只有 rank 0。
         # 等备份完成后才允许 demote；降级前后分别验收 L1/L2 起点。
         before_state = client.wait_cache(case["prefix"])
         for rank, value in rank_states(before_state, rank_reader.tp).items():
@@ -349,9 +340,8 @@ def execute_sample(client, case, group, output_length, stage="measure"):
             detailed_annotations=True,
         ), stage="profile_start", parse_json=False)
     try:
-        kwargs = {'skip_cache_insert': True} if reuse else {}
         result, elapsed, rid = client.generate(
-            case["prefix"] + case["suffix"], output_length, stage, **kwargs)
+            case["prefix"] + case["suffix"], output_length, stage, skip_cache_insert=baseline is not None)
         window = dict(getattr(client, "last_request_window", None) or {})
     finally:
         if profiled:
@@ -359,13 +349,13 @@ def execute_sample(client, case, group, output_length, stage="measure"):
     errors, hits = validate(result, p, s, output_length, group)
     extra = {}
     if before_state is not None:
-        # 请求结束后等 ACK 被处理再读终值；等待本身不计入客户端请求延迟。
+        # 请求结束后确认所有 rank 空闲，再等指标发布；等待不计入客户端请求延迟。
         after_state = client.wait_cache(case["prefix"])
         extra = rank_reader.finish(before_metrics, stage, rid,
                                    p=p, s=s, group=group, state=before_state)
-        if reuse:
+        if baseline is not None:
             try:
-                check_reused_prefix(client, case, after_state)
+                check_reused_prefix(client, case, baseline, after_state)
             except RuntimeError as exc:
                 errors.append('[Prefix reuse] ' + str(exc))
         if (stage in ('measure', 'warmup') and getattr(rank_reader, 'gpu_timing', False)
@@ -412,7 +402,7 @@ def execute_sample(client, case, group, output_length, stage="measure"):
         invalid_reason="; ".join(errors),
         output_ids=json.dumps(result.get("output_ids")),
         profiled=profiled,
-        prefix_reuse=reuse,
+        prefix_reuse=baseline is not None,
         cache_valid=cache_valid,
         **window,
         **environment_result,
@@ -478,100 +468,79 @@ def check_server(info, cases, output_length, groups=None):
 
 
 def run_samples(client, cases, args, writer, file, common):
-    """每个 P 先做所有 cold，再准备一次 P，跨 S 收集命中样本。
+    """安排每个 P 的测量顺序，复用时先完成全部 cold/reference，再建立 P。"""
+    def save(row):
+        writer.writerow({**row, **common})
+        file.flush()  # 无效尝试和致命错误前的最后一行也要落盘。
 
-    cold reference 仍计算完整 P+S，只把它集中到准备 P 之前。各 S 的
-    命中预热和重复仍逐点收集；不在网格中全局打乱，也不伪造缓存状态。
-    """
-    client.prefix_reuse = False
-    hits = [g for g in args.groups if g != 'cold']
-    if not getattr(args, 'prefix_reuse', False) or not hits:
-        return _sample_cases(client, cases, args, writer, file, common)
-    reader = getattr(client, 'rank_metrics', None)
-    if not reader or not client.hicache:
-        raise ValueError('前缀复用需要 HiCache 实验接口；使用 --no-prefix-reuse 可逐次准备')
-    state = client.wait_cache(cases[0]['prefix'])
-    if any(v.get('skip_radix_cache_insert') is not True
-           for v in rank_states(state, reader.tp).values()):
-        raise ValueError('服务不支持请求级缓存写入控制；更新补丁或使用 --no-prefix-reuse')
-    rng = random.Random(args.seed)
-    for p in dict.fromkeys(len(case['prefix']) for case in cases):
-        batch = [case for case in cases if len(case['prefix']) == p]
-        references = {}
-        if 'cold' in args.groups:
-            cold_args = argparse.Namespace(**{**vars(args), 'groups': ['cold']})
-            _sample_cases(client, batch, cold_args, writer, file, common, references, rng)
-        else:
-            for case in batch:
-                reference = execute_sample(client, case, 'cold', args.output_length, 'reference')
-                if not reference['valid']:
-                    raise RuntimeError('Cold reference failed: ' + reference['invalid_reason'])
-                references[case['id']] = reference['output_ids']
-        client.prefix_state = prepare_prefix(client, batch[0])
-        client.prefix_reuse = True
-        try:
-            hit_args = argparse.Namespace(**{**vars(args), 'groups': hits})
-            _sample_cases(client, batch, hit_args, writer, file, common, references, rng)
-        finally:
-            client.prefix_reuse = False
+    def cold_reference(case):
+        row = execute_sample(client, case, "cold", args.output_length, "reference")
+        if not row["valid"]:
+            raise RuntimeError("Cold reference failed: " + row["invalid_reason"])
+        return row["output_ids"]
 
+    # 全轮使用同一个随机序列，只打乱当前组合中尚未收满的组。
+    collect = partial(collect_case, client, args, random.Random(args.seed), save)
+    hits = [group for group in args.groups if group != "cold"]
+    reader = getattr(client, "rank_metrics", None)
+    if not getattr(args, "prefix_reuse", False) or not hits:
+        for case in cases:
+            reference = cold_reference(case) if reader and "cold" not in args.groups else None
+            collect(case, args.groups, reference)
+        return
 
-def _sample_cases(client, cases, args, writer, file, common, references=None, rng=None):
-    """一套收集循环供 cold、复用命中和逐次准备共用，避免分叉验证规则。"""
-    references = {} if references is None else references
-    rng = rng or random.Random(args.seed)
+    if not reader:
+        raise ValueError("前缀复用需要缓存实验接口；使用 --no-prefix-reuse 可逐次准备")
+    state = client.wait_cache(cases[0]["prefix"])
+    if any(rank.get("skip_radix_cache_insert") is not True for rank in rank_states(state, reader.tp).values()):
+        raise ValueError("服务不支持请求级缓存写入控制；更新补丁或使用 --no-prefix-reuse")
+    by_prefix = {}
     for case in cases:
-        reference_output = references.get(case['id'])
-        if reference_output is None and getattr(client, "rank_metrics", None) and "cold" not in args.groups:
-            reference = execute_sample(client, case, "cold", args.output_length, "reference")
-            if not reference["valid"]:
-                raise RuntimeError("Cold reference failed: " + reference["invalid_reason"])
-            reference_output = reference["output_ids"]
-        # 这里的 warmup 用于预热运行路径，不写入 samples.csv。
-        # prepare 只建立缓存；复用时一个 P 的所有 S 共用它。
-        for _ in range(args.warmup_rounds):
-            for group in args.groups:
-                row = execute_sample(client, case, group, args.output_length, "warmup")
-                if not row["valid"]:
-                    raise RuntimeError("Warmup failed: " + row["invalid_reason"])
-                if reference_output is None:
-                    reference_output = row["output_ids"]
-                elif row["output_ids"] != reference_output:
-                    raise RuntimeError("Warmup Cold/L1/L2 输出 token 不一致")
-        valid = dict.fromkeys(args.groups, 0)
-        attempts = dict.fromkeys(args.groups, 0)
-        while any(valid[g] < args.repeats for g in args.groups):
-            # 每轮只运行尚未收满的组，并打乱顺序，减少固定先后顺序的影响。
-            groups = [g for g in args.groups if valid[g] < args.repeats]
-            rng.shuffle(groups)
-            for group in groups:
-                if attempts[group] >= args.max_attempts:
-                    raise RuntimeError(
-                        f"{case['id']}/{group}: insufficient valid samples "
-                        f"after {args.max_attempts} attempts"
-                    )
-                attempts[group] += 1
-                row = execute_sample(client, case, group, args.output_length)
-                if row["valid"]:
-                    if reference_output is None:
-                        reference_output = row["output_ids"]
-                    elif row["output_ids"] != reference_output:
-                        row["valid"] = False
-                        row["cache_valid"] = False
-                        row["invalid_reason"] = "相同测量输入的生成 token 与本组实验参考结果不一致"
-                row.update(common, attempt=attempts[group])
-                # 无效样本也立即落盘，但只增加 attempts，不增加 valid。
-                writer.writerow(row)
-                file.flush()
-                if any(tag in row['invalid_reason'] for tag in ('[Graph]', '[Prefix reuse]')):
-                    raise RuntimeError(f"{case['id']}/{group}: {row['invalid_reason']}")
-                valid[group] += int(row["valid"])
-                print(
-                    f"{case['id']} {group}: valid {valid[group]}/{args.repeats}, "
-                    f"client={row['client_latency_ms']:.2f} ms {row['invalid_reason']}",
-                    flush=True,
-                )
-        references[case['id']] = reference_output
+        by_prefix.setdefault(len(case["prefix"]), []).append(case)
+    for batch in by_prefix.values():
+        references = [collect(case, ["cold"]) if "cold" in args.groups else cold_reference(case)
+                      for case in batch]
+        baseline = prepare_prefix(client, batch[0])
+        for case, reference in zip(batch, references):
+            collect(case, hits, reference, baseline=baseline)
+
+
+def collect_case(client, args, rng, save, case, groups, reference=None, *, baseline=None):
+    """收齐一个 P/S 组合的有效样本，返回供命中组比对的输出 token。"""
+    for _ in range(args.warmup_rounds):
+        for group in groups:
+            row = execute_sample(client, case, group, args.output_length, "warmup", baseline=baseline)
+            if not row["valid"]:
+                raise RuntimeError("Warmup failed: " + row["invalid_reason"])
+            if reference is None:
+                reference = row["output_ids"]
+            elif row["output_ids"] != reference:
+                raise RuntimeError("Warmup Cold/L1/L2 输出 token 不一致")
+
+    valid = dict.fromkeys(groups, 0)
+    attempts = dict.fromkeys(groups, 0)
+    while pending := [g for g in groups if valid[g] < args.repeats]:
+        rng.shuffle(pending)
+        for group in pending:
+            if attempts[group] >= args.max_attempts:
+                raise RuntimeError(f"{case['id']}/{group}: insufficient valid samples "
+                                   f"after {args.max_attempts} attempts")
+            attempts[group] += 1
+            row = execute_sample(client, case, group, args.output_length, baseline=baseline)
+            if row["valid"]:
+                if reference is None:
+                    reference = row["output_ids"]
+                elif row["output_ids"] != reference:
+                    row.update(valid=False, cache_valid=False,
+                               invalid_reason="相同测量输入的生成 token 与本组实验参考结果不一致")
+            row["attempt"] = attempts[group]
+            save(row)
+            if any(tag in row["invalid_reason"] for tag in ("[Graph]", "[Prefix reuse]")):
+                raise RuntimeError(f"{case['id']}/{group}: {row['invalid_reason']}")
+            valid[group] += int(row["valid"])
+            print(f"{case['id']} {group}: valid {valid[group]}/{args.repeats}, "
+                  f"client={row['client_latency_ms']:.2f} ms {row['invalid_reason']}", flush=True)
+    return reference
 
 
 def run(args):
@@ -632,8 +601,8 @@ def run(args):
             if (Path(args.tokenizer) / name).is_file()
         }
         text = Path(args.text_file).read_text() if args.text_file else TEXT
-        cases = make_cases(tokenizer, args.prefix_lengths, args.suffix_lengths, text)
-        write_json(directory / "inputs.json", input_manifest(tokenizer, cases, text))
+        cases, manifest = make_cases(tokenizer, args.prefix_lengths, args.suffix_lengths, text)
+        write_json(directory / "inputs.json", manifest)
         with (directory / "responses.jsonl").open("w") as events:
             client = Client(args.base_url, args.timeout, events)
             if args.telemetry_dir:
@@ -684,7 +653,15 @@ def run(args):
             model_config = json.loads(model_config_path.read_text()) if model_config_path.is_file() else {}
             text_config = model_config.get("text_config", model_config)
             hybrid = "qwen3_5" in text_config.get("model_type", "")
-            if hybrid or info["tp_size"] > 1:
+            deepseek_v4 = text_config.get('model_type') == 'deepseek_v4'
+            config['model_type'] = text_config.get('model_type')
+            config['cache_mode'] = 'hierarchical' if info.get('enable_hierarchical_cache') else 'device'
+            if deepseek_v4:
+                if info.get('enable_hierarchical_cache') or 'l2' in args.groups:
+                    raise ValueError('DeepSeek V4 第一版仅支持无 HiCache 的 cold/L1')
+                if info.get('ep_size', 1) != 1 or info.get('page_size') != 256:
+                    raise ValueError('DeepSeek V4 FP4 实验需要 EP=1、page-size=256')
+            if hybrid or deepseek_v4 or info["tp_size"] > 1:
                 if not args.gpu_timing or args.output_length != 1:
                     raise ValueError("混合/多卡实验要求 GPU timing 和单 token 输出")
                 chunk = info.get("chunked_prefill_size")
@@ -702,13 +679,18 @@ def run(args):
                     raise ValueError(f"实际 KV 容量不足或缺失：{capacities}")
             client.hicache = bool(info.get("enable_hierarchical_cache"))
             if args.gpu_timing:
-                if not client.hicache:
-                    raise ValueError("GPU 时间归属依赖 HiCache 空闲检查，请启用 HICACHE=1")
+                if not info.get('enable_hicache_experiment'):
+                    raise ValueError("GPU 时间归属需要开启缓存实验接口，以确认所有 rank 空闲")
                 # 用完整 P 建立原生 extend 指标，并等完成后读取；不进入采样 CSV。
                 client.flush()
                 client.generate(cases[0]["prefix"], 1, "timing_init")
-                client.wait_cache(cases[0]["prefix"])
-            if client.hicache:
+                initial_state = client.wait_cache(cases[0]["prefix"])
+                config['cache_layout'] = {
+                    str(rank): {key: value for key, value in state.items()
+                                if key in ('cache_mode', 'cache_components', 'pool_ownership', 'device_pools')}
+                    for rank, state in rank_states(initial_state, info['tp_size']).items()
+                }
+            if client.hicache or args.gpu_timing:
                 client.rank_metrics = RankMetrics(client, info, hybrid, directory / "rank-metrics.jsonl",
                                                  gpu_timing=args.gpu_timing)
                 if args.gpu_timing:
